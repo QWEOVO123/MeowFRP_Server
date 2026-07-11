@@ -61,15 +61,23 @@ func (m *Manager) StartEmbeddedFRPS(ctx context.Context, appCfg config.Config) e
 }
 
 func (m *Manager) Close() error {
+	m.stopConnectionCleanup()
 	m.mu.Lock()
 	service := m.frps
 	m.frps = nil
 	m.running = false
 	m.mu.Unlock()
-	if service == nil {
-		return nil
+	var serviceErr error
+	if service != nil {
+		serviceErr = service.Close()
 	}
-	return service.Close()
+	for _, conn := range m.clearTrackedConnections() {
+		abortiveClose(conn.userConn)
+		if conn.workConn != nil {
+			abortiveClose(conn.workConn)
+		}
+	}
+	return serviceErr
 }
 
 func (m *Manager) Status(appCfg config.Config) Status {

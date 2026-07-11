@@ -16,6 +16,12 @@ import (
 	"frp-control-server/internal/dpiengine"
 )
 
+const (
+	defaultUDPFlowTimeout = 10 * time.Second
+	udpCleanupInterval    = time.Second
+	maxTrackedUDPFlows    = 32768
+)
+
 type Inspector interface {
 	Inspect(context.Context, dpiengine.TrafficSample) dpi.Decision
 }
@@ -65,6 +71,7 @@ type activeTCPConnection struct {
 
 type Manager struct {
 	mu                   sync.RWMutex
+	closeOnce            sync.Once
 	inspector            Inspector
 	bindings             map[string]ProxyBinding
 	leaseClientAddresses map[string]string
@@ -72,19 +79,38 @@ type Manager struct {
 	udpFlows             map[string]ActiveConnection
 	blockedInboundIPs    map[string]BlockedInboundIP
 	nextConnectionID     uint64
+	udpFlowTimeout       time.Duration
+	maxUDPFlows          int
+	cleanupStop          chan struct{}
+	cleanupDone          chan struct{}
 	frps                 *frpserver.Service
 	running              bool
 }
 
 func NewManager(inspector Inspector) *Manager {
-	return &Manager{
+	manager := &Manager{
 		inspector:            inspector,
 		bindings:             map[string]ProxyBinding{},
 		leaseClientAddresses: map[string]string{},
 		tcpConnections:       map[string]*activeTCPConnection{},
 		udpFlows:             map[string]ActiveConnection{},
 		blockedInboundIPs:    map[string]BlockedInboundIP{},
+		udpFlowTimeout:       defaultUDPFlowTimeout,
+		maxUDPFlows:          maxTrackedUDPFlows,
+		cleanupStop:          make(chan struct{}),
+		cleanupDone:          make(chan struct{}),
 	}
+	go manager.runConnectionCleanup()
+	return manager
+}
+
+func (m *Manager) SetUDPFlowTimeout(timeout time.Duration) {
+	if timeout <= 0 {
+		timeout = defaultUDPFlowTimeout
+	}
+	m.mu.Lock()
+	m.udpFlowTimeout = timeout
+	m.mu.Unlock()
 }
 
 func (m *Manager) SetInspector(inspector Inspector) {
@@ -203,6 +229,9 @@ func (m *Manager) ObserveUDPFlow(_ context.Context, info dpihook.ConnectionInfo)
 	key := strings.Join([]string{info.LeaseID, info.ProxyName, info.RemoteAddr}, "\x00")
 	flow := m.udpFlows[key]
 	if flow.ID == "" {
+		if m.maxUDPFlows > 0 && len(m.udpFlows) >= m.maxUDPFlows {
+			return
+		}
 		m.nextConnectionID++
 		flow.ID = "udp_" + strconv.FormatUint(m.nextConnectionID, 10)
 		flow.OpenedAt = now
@@ -227,18 +256,17 @@ func (m *Manager) ObserveUDPFlow(_ context.Context, info dpihook.ConnectionInfo)
 
 func (m *Manager) ListConnections(udpTimeout time.Duration) []ActiveConnection {
 	if udpTimeout <= 0 {
-		udpTimeout = 10 * time.Second
+		udpTimeout = defaultUDPFlowTimeout
 	}
 	now := time.Now()
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	connections := make([]ActiveConnection, 0, len(m.tcpConnections)+len(m.udpFlows))
 	for _, conn := range m.tcpConnections {
 		connections = append(connections, conn.ActiveConnection)
 	}
-	for key, flow := range m.udpFlows {
+	for _, flow := range m.udpFlows {
 		if now.Sub(flow.LastSeenAt) > udpTimeout {
-			delete(m.udpFlows, key)
 			continue
 		}
 		connections = append(connections, flow)
@@ -247,9 +275,10 @@ func (m *Manager) ListConnections(udpTimeout time.Duration) []ActiveConnection {
 }
 
 func (m *Manager) TerminateTCPConnection(id string) bool {
-	m.mu.RLock()
+	m.mu.Lock()
 	conn := m.tcpConnections[id]
-	m.mu.RUnlock()
+	delete(m.tcpConnections, id)
+	m.mu.Unlock()
 	if conn == nil {
 		return false
 	}
@@ -292,9 +321,10 @@ func (m *Manager) terminateConnections(match func(ActiveConnection) bool) int {
 	m.mu.Lock()
 	tcpToClose := make([]*activeTCPConnection, 0)
 	closed := 0
-	for _, conn := range m.tcpConnections {
+	for key, conn := range m.tcpConnections {
 		if match(conn.ActiveConnection) {
 			tcpToClose = append(tcpToClose, conn)
+			delete(m.tcpConnections, key)
 			closed++
 		}
 	}
@@ -332,9 +362,10 @@ func (m *Manager) setBlockedInboundIP(block BlockedInboundIP, closeExisting bool
 	m.blockedInboundIPs[block.IP] = block
 	tcpToClose := make([]*activeTCPConnection, 0)
 	if closeExisting {
-		for _, conn := range m.tcpConnections {
+		for key, conn := range m.tcpConnections {
 			if conn.InboundIP == block.IP {
 				tcpToClose = append(tcpToClose, conn)
+				delete(m.tcpConnections, key)
 			}
 		}
 	}
@@ -366,6 +397,58 @@ func (m *Manager) ListBlockedInboundIPs() []BlockedInboundIP {
 		blocks = append(blocks, block)
 	}
 	return blocks
+}
+
+func (m *Manager) runConnectionCleanup() {
+	ticker := time.NewTicker(udpCleanupInterval)
+	defer func() {
+		ticker.Stop()
+		close(m.cleanupDone)
+	}()
+	for {
+		select {
+		case now := <-ticker.C:
+			m.cleanupExpiredUDPFlows(now)
+		case <-m.cleanupStop:
+			return
+		}
+	}
+}
+
+func (m *Manager) cleanupExpiredUDPFlows(now time.Time) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	timeout := m.udpFlowTimeout
+	if timeout <= 0 {
+		timeout = defaultUDPFlowTimeout
+	}
+	removed := 0
+	for key, flow := range m.udpFlows {
+		if now.Sub(flow.LastSeenAt) > timeout {
+			delete(m.udpFlows, key)
+			removed++
+		}
+	}
+	return removed
+}
+
+func (m *Manager) stopConnectionCleanup() {
+	m.closeOnce.Do(func() {
+		close(m.cleanupStop)
+		<-m.cleanupDone
+	})
+}
+
+func (m *Manager) clearTrackedConnections() []*activeTCPConnection {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	connections := make([]*activeTCPConnection, 0, len(m.tcpConnections))
+	for _, conn := range m.tcpConnections {
+		connections = append(connections, conn)
+	}
+	clear(m.tcpConnections)
+	clear(m.udpFlows)
+	return connections
 }
 
 func (m *Manager) FeedTrafficSample(ctx context.Context, sample dpiengine.TrafficSample) dpi.Decision {

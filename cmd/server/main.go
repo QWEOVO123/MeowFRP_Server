@@ -65,6 +65,7 @@ func main() {
 		EventSink:      dpiEventSink,
 	})
 	frpCore := frpcore.NewManager(dpiService)
+	frpCore.SetUDPFlowTimeout(cfg.UDPConnectionTTL)
 	if store != nil {
 		if blocks, err := store.ListBlockedInboundIPs(context.Background()); err == nil {
 			for _, block := range blocks {

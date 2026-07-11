@@ -58,6 +58,7 @@ func NewServer(cfg config.Config, store *db.Store, opts ...Option) *Server {
 	if server.core == nil {
 		server.core = frpcore.NewManager(server.dpi)
 	}
+	server.core.SetUDPFlowTimeout(cfg.UDPConnectionTTL)
 	return server
 }
 
@@ -255,6 +256,9 @@ func (s *Server) setRuntime(cfg config.Config, store *db.Store) {
 	s.cfg = cfg
 	s.store = store
 	s.mu.Unlock()
+	if s.core != nil {
+		s.core.SetUDPFlowTimeout(cfg.UDPConnectionTTL)
+	}
 	if s.dpi != nil && store != nil {
 		s.dpi.SetPolicyProvider(store)
 		s.dpi.SetEventSink(store)
