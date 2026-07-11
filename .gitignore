@@ -1,0 +1,32 @@
+# Runtime configuration and secrets
+frp-control-server.cfg.json
+.env
+.env.*
+!.env.example
+
+# Build and release output
+/bin/
+/dist/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Frontend dependencies and output
+/front/node_modules/
+/front/dist/
+
+# Logs, coverage, and local state
+*.log
+coverage.out
+*.db
+*.sqlite
+*.sqlite3
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.user
+*.suo
+.DS_Store
+Thumbs.db

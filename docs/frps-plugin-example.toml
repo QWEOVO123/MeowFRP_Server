@@ -1,0 +1,9 @@
+# Add this to frps.toml.
+
+bindPort = 7000
+
+[[httpPlugins]]
+name = "frp-control-server"
+addr = "127.0.0.1:8080"
+path = "/api/v1/frp/plugin"
+ops = ["Login", "NewProxy", "CloseProxy", "Ping", "NewWorkConn", "NewUserConn"]
