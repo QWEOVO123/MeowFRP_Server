@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"frp-control-server/internal/config"
 	"frp-control-server/internal/db"
 	"frp-control-server/internal/frpcore"
 	"frp-control-server/internal/policy"
@@ -72,6 +73,10 @@ type frpNewUserConnContent struct {
 }
 
 func (s *Server) frpPlugin(w http.ResponseWriter, r *http.Request) {
+	if s.getConfig().Mode == config.ModeEdge {
+		s.edgeFrpPlugin(w, r)
+		return
+	}
 	if s.getStore() == nil {
 		writeJSON(w, http.StatusOK, frpReject("system setup required"))
 		return

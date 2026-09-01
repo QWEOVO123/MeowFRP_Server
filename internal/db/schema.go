@@ -85,6 +85,7 @@ var schemaStatements = []string{
 		status VARCHAR(32) NOT NULL,
 		ban_reason VARCHAR(512) NULL,
 		frpc_addr VARCHAR(128) NOT NULL DEFAULT '',
+		frpc_running BOOLEAN NOT NULL DEFAULT FALSE,
 		last_seen_at DATETIME(3) NULL,
 		created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 		updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
@@ -103,6 +104,7 @@ var schemaStatements = []string{
 		created_by BIGINT NOT NULL DEFAULT 0,
 		created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 		delivered_at DATETIME(3) NULL,
+		acknowledged_at DATETIME(3) NULL,
 		CONSTRAINT fk_client_commands_client FOREIGN KEY(client_id) REFERENCES clients(id) ON DELETE CASCADE,
 		INDEX idx_client_commands_client(client_id, status, id),
 		INDEX idx_client_commands_status(status, created_at)
@@ -219,6 +221,7 @@ var schemaStatements = []string{
 
 	`CREATE TABLE IF NOT EXISTS dpi_events (
 		id BIGINT PRIMARY KEY AUTO_INCREMENT,
+		node_id VARCHAR(64) NOT NULL DEFAULT '',
 		user_id BIGINT NOT NULL DEFAULT 0,
 		token_id BIGINT NOT NULL DEFAULT 0,
 		client_id VARCHAR(128) NOT NULL DEFAULT '',
@@ -243,6 +246,116 @@ var schemaStatements = []string{
 		INDEX idx_dpi_events_token(token_id, created_at),
 		INDEX idx_dpi_events_lease(lease_id)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+	`CREATE TABLE IF NOT EXISTS edge_nodes (
+		node_id VARCHAR(64) PRIMARY KEY,
+		name VARCHAR(128) NOT NULL,
+		certificate_serial VARCHAR(128) NOT NULL DEFAULT '',
+		status VARCHAR(32) NOT NULL DEFAULT 'active',
+		last_seen_at DATETIME(3) NULL,
+		last_remote_addr VARCHAR(128) NOT NULL DEFAULT '',
+		public_api_url VARCHAR(512) NOT NULL DEFAULT '',
+		selectable BOOLEAN NOT NULL DEFAULT FALSE,
+		capabilities_json TEXT NOT NULL,
+		created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+		updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+		INDEX idx_edge_nodes_status(status),
+		INDEX idx_edge_nodes_seen(last_seen_at)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+	`CREATE TABLE IF NOT EXISTS node_enrollment_tokens (
+		id BIGINT PRIMARY KEY AUTO_INCREMENT,
+		token_hash CHAR(64) NOT NULL UNIQUE,
+		plain_token VARCHAR(192) NULL UNIQUE,
+		token_prefix VARCHAR(32) NOT NULL,
+		status VARCHAR(32) NOT NULL DEFAULT 'active',
+		max_uses INT NOT NULL DEFAULT 1,
+		use_count INT NOT NULL DEFAULT 0,
+		expires_at DATETIME(3) NOT NULL,
+		created_by BIGINT NOT NULL DEFAULT 0,
+		created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+		used_at DATETIME(3) NULL,
+		INDEX idx_node_enrollment_tokens_status(status, expires_at)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+	`CREATE TABLE IF NOT EXISTS node_events (
+		id BIGINT PRIMARY KEY AUTO_INCREMENT,
+		node_id VARCHAR(64) NOT NULL,
+		sequence BIGINT NOT NULL,
+		event_type VARCHAR(64) NOT NULL,
+		event_id VARCHAR(96) NULL,
+		payload_json LONGTEXT NOT NULL,
+		created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+		UNIQUE KEY uq_node_event_sequence(node_id, sequence),
+		UNIQUE KEY uq_node_event_id(node_id,event_id),
+		INDEX idx_node_events_created(created_at),
+		CONSTRAINT fk_node_events_node FOREIGN KEY(node_id) REFERENCES edge_nodes(node_id) ON DELETE CASCADE
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+	`CREATE TABLE IF NOT EXISTS edge_client_presence (
+		node_id VARCHAR(64) NOT NULL,
+		user_id BIGINT NOT NULL,
+		token_id BIGINT NOT NULL,
+		client_id VARCHAR(191) NOT NULL,
+		frpc_running BOOLEAN NOT NULL DEFAULT FALSE,
+		last_seen_at DATETIME(3) NOT NULL,
+		updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+		PRIMARY KEY(node_id,token_id,client_id),
+		INDEX idx_edge_presence_seen(last_seen_at),
+		CONSTRAINT fk_edge_presence_node FOREIGN KEY(node_id) REFERENCES edge_nodes(node_id) ON DELETE CASCADE
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+	`CREATE TABLE IF NOT EXISTS edge_connection_presence (
+		node_id VARCHAR(64) NOT NULL,
+		connection_id VARCHAR(128) NOT NULL,
+		protocol VARCHAR(16) NOT NULL,
+		user_id BIGINT NOT NULL DEFAULT 0,
+		token_id BIGINT NOT NULL DEFAULT 0,
+		client_id VARCHAR(191) NOT NULL DEFAULT '',
+		client_addr VARCHAR(128) NOT NULL DEFAULT '',
+		lease_id VARCHAR(64) NOT NULL DEFAULT '',
+		proxy_name VARCHAR(128) NOT NULL DEFAULT '',
+		proxy_type VARCHAR(16) NOT NULL DEFAULT '',
+		remote_port INT NOT NULL DEFAULT 0,
+		inbound_addr VARCHAR(128) NOT NULL DEFAULT '',
+		inbound_ip VARCHAR(64) NOT NULL DEFAULT '',
+		inbound_port INT NOT NULL DEFAULT 0,
+		server_addr VARCHAR(128) NOT NULL DEFAULT '',
+		opened_at DATETIME(3) NOT NULL,
+		last_seen_at DATETIME(3) NOT NULL,
+		can_terminate BOOLEAN NOT NULL DEFAULT FALSE,
+		updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+		PRIMARY KEY(node_id,connection_id),
+		INDEX idx_edge_connections_seen(last_seen_at),
+		INDEX idx_edge_connections_client(node_id,token_id,client_id),
+		CONSTRAINT fk_edge_connections_node FOREIGN KEY(node_id) REFERENCES edge_nodes(node_id) ON DELETE CASCADE
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+	`CREATE TABLE IF NOT EXISTS edge_node_traffic (
+		node_id VARCHAR(64) PRIMARY KEY,
+		bytes_inbound BIGINT UNSIGNED NOT NULL DEFAULT 0,
+		bytes_outbound BIGINT UNSIGNED NOT NULL DEFAULT 0,
+		samples_inbound BIGINT UNSIGNED NOT NULL DEFAULT 0,
+		samples_outbound BIGINT UNSIGNED NOT NULL DEFAULT 0,
+		started_at DATETIME(3) NOT NULL,
+		captured_at DATETIME(3) NOT NULL,
+		updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+		CONSTRAINT fk_edge_traffic_node FOREIGN KEY(node_id) REFERENCES edge_nodes(node_id) ON DELETE CASCADE
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+
+	`CREATE TABLE IF NOT EXISTS node_commands (
+		command_id VARCHAR(64) PRIMARY KEY,
+		node_id VARCHAR(64) NOT NULL,
+		command_type VARCHAR(64) NOT NULL,
+		payload_json LONGTEXT NOT NULL,
+		status VARCHAR(32) NOT NULL DEFAULT 'pending',
+		result_json LONGTEXT NULL,
+		expires_at DATETIME(3) NOT NULL,
+		created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+		updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+		INDEX idx_node_commands_delivery(node_id, status, expires_at),
+		CONSTRAINT fk_node_commands_node FOREIGN KEY(node_id) REFERENCES edge_nodes(node_id) ON DELETE CASCADE
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 }
 
 var schemaMigrationStatements = []string{
@@ -255,4 +368,12 @@ var schemaMigrationStatements = []string{
 	`ALTER TABLE dpi_events ADD COLUMN local_addr VARCHAR(128) NOT NULL DEFAULT '' AFTER remote_port`,
 	`ALTER TABLE dpi_events ADD COLUMN remote_addr VARCHAR(128) NOT NULL DEFAULT '' AFTER local_addr`,
 	`ALTER TABLE clients ADD COLUMN frpc_addr VARCHAR(128) NOT NULL DEFAULT '' AFTER ban_reason`,
+	`ALTER TABLE clients ADD COLUMN frpc_running BOOLEAN NOT NULL DEFAULT FALSE AFTER frpc_addr`,
+	`ALTER TABLE edge_nodes ADD COLUMN public_api_url VARCHAR(512) NOT NULL DEFAULT '' AFTER last_remote_addr`,
+	`ALTER TABLE edge_nodes ADD COLUMN selectable BOOLEAN NOT NULL DEFAULT FALSE AFTER public_api_url`,
+	`ALTER TABLE node_enrollment_tokens ADD COLUMN plain_token VARCHAR(192) NULL UNIQUE AFTER token_hash`,
+	`ALTER TABLE node_events ADD COLUMN event_id VARCHAR(96) NULL AFTER event_type`,
+	`ALTER TABLE node_events ADD UNIQUE KEY uq_node_event_id(node_id,event_id)`,
+	`ALTER TABLE dpi_events ADD COLUMN node_id VARCHAR(64) NOT NULL DEFAULT '' AFTER id`,
+	`ALTER TABLE client_commands ADD COLUMN acknowledged_at DATETIME(3) NULL AFTER delivered_at`,
 }

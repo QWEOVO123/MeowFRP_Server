@@ -13,10 +13,10 @@ Companion client project: [`MeowFRP_Client`](https://github.com/QWEOVO123/MeowFR
 - Administrator sessions derived from a fixed admin token with configurable expiration
 - Automatic HTTPS API token creation for regular users
 - Per-user remote-port ranges, tunnel limits, and protocol permissions
-- Short-lived FRP runtime tokens and server-generated client configurations
+- Server-generated client configurations with 24-hour FRP runtime leases that are revoked early on logout or heartbeat timeout
 - Immediate enforcement when a user, token, client device, or inbound IP is banned
 - Connected-client presence tracked by ten-second HTTPS heartbeats
-- Remote client commands for stopping FRP, displaying a warning, and forcing reauthentication
+- Remote client commands for stopping FRP, displaying a warning, and forcing reauthentication, with HTTPS acknowledgements and retry
 - Active TCP/UDP connection inventory, TCP termination, and inbound-IP blocking
 - Configurable UDP pseudo-connection timeout
 - Historical client records with explicit deletion
@@ -90,6 +90,19 @@ npm ci
 npm run build
 ```
 
+## Controller and edge modes
+
+The same server binary and web panel support two deployment modes. When the runtime configuration is missing or invalid, the API listens on port 8080 on all interfaces and exposes only the setup flow.
+
+- `controller` uses MySQL and can run as a standalone server. Edge access can later be enabled from System Settings.
+- `edge` is enrolled with a controller address and a short-lived, single-use enrollment token. It uses an embedded SQLite state database and does not need MySQL.
+
+Enrollment reuses the Controller's existing HTTPS API and can be reverse-proxied by Nginx on port 443. The Edge creates its private key locally and submits a CSR with a ten-minute, single-use enrollment token stored in plaintext in MySQL. It then switches automatically to the dedicated gRPC/HTTP2 mTLS endpoint (port 9443 by default). Edge certificates are valid for one year and are not renewed automatically; after expiry, an administrator generates a new enrollment token and manually reconnects from the Edge panel, then restarts the process to load the renewed cfg identity. Certificate material is stored as Base64 in cfg and private keys are never returned by management APIs.
+
+The same bidirectional mTLS stream carries a configurable 2–60 second heartbeat, client presence, connection snapshots, traffic counters, ACKed runtime-log/DPI event replay, and idempotent Controller commands. The Controller panel can aggregate Edge clients and connections, remotely terminate TCP connections, disconnect clients, and apply node-scoped or global inbound-IP blocks. Every report and remote action remains controlled by the Edge's local permission switches.
+
+The Edge panel also has a default-off “Allow Controller administration” master switch that can only be changed locally. When enabled, the Controller panel may update that Edge's reporting/remote-command permissions and, while the node is online, rotate its local administrator username and password. The plaintext password exists only in the Controller HTTPS request and the in-memory mTLS message; the Edge computes the bcrypt hash locally, and the password is never stored in MySQL, an offline command queue, or audit details. A successful rotation immediately invalidates existing Edge administrator sessions.
+
 The generated static files are written to `front/dist`.
 
 Run the test suite:
@@ -103,10 +116,10 @@ go test ./...
 Start the backend from a writable working directory:
 
 ```bash
-./MeowFRP_server -port=8080
+./MeowFRP_server -APIport=8080 -APIbind=127.0.0.1
 ```
 
-The API listener defaults to port `8080`; `-port` overrides it. On first launch, the server enters setup mode. Open the web panel and provide:
+The API listener defaults to port `8080` on all interfaces. Use `-APIport` to override the port and `-APIbind=127.0.0.1` to restrict it to localhost; the old `-port` flag remains as an alias. Administrator cookies are always `Secure`, so production panel access must use HTTPS (normally through Nginx).
 
 - the initial administrator username and password;
 - the MySQL host, port, username, password, and database name.
@@ -142,19 +155,24 @@ server {
 }
 ```
 
-Expose the configured FRP bind port and the remote-port ranges assigned to users. Keep the backend API behind HTTPS in production.
+Every Controller/Edge has its own node tag, public API URL, advertised FRP address, FRP control port, and usable port pool. The node pool is intersected with user policy and token grants, while API, FRP control, Controller mTLS, and currently leased ports are excluded. Changing the FRP control port requires a process restart; advertised addresses and port pools are saved immediately. A Controller can push these settings over mTLS only after the Edge enables Controller administration and runtime-setting changes.
+
+Cloud security groups and host firewalls usually do not open `1024-65535` by default. Explicitly allow the configured FRP control port and the TCP/UDP subset used by each node's port pool. Keep the backend API behind HTTPS in production.
 
 ## Client Flow
 
-1. MeowFRP Client authenticates with its long-lived HTTPS API token and device ID.
-2. `POST /api/v1/client/resource-policy` returns the FRP endpoint, permitted protocols, remote-port range, tunnel limit, and DPI status.
-3. The user selects tunnels within that policy.
-4. `POST /api/v1/client/bootstrap` validates the request and returns a generated configuration containing a short-lived FRP token.
-5. Embedded `frps` validates the runtime token and allows only proxies allocated to that lease.
-6. The client sends `POST /api/v1/client/heartbeat` every ten seconds and receives queued control commands.
-7. A normal exit or forced reauthentication calls `POST /api/v1/client/logout` to remove the client from the online list immediately.
+1. MeowFRP Client first calls the Controller's unauthenticated `GET /api/v1/public/nodes`. The directory contains the Controller itself and selectable Edges, including tag, public API URL, node type, and online status.
+2. After node selection, the Client sends its long-lived token and device ID directly to that Edge; the Controller does not proxy the token.
+3. The Edge's `POST /api/v1/client/resource-policy` returns the FRP endpoint, permitted protocols, remote-port range, tunnel limit, and DPI status.
+4. The user selects tunnels within that policy.
+5. The Edge validates `POST /api/v1/client/bootstrap` against token hashes and policies synchronized into SQLite over mTLS, then returns a configuration containing a short-lived FRP token.
+6. Embedded `frps` validates the runtime token and allows only proxies allocated to that lease.
+7. The client sends `POST /api/v1/client/heartbeat` every ten seconds and receives queued control commands. Commands are retried until the client executes them and acknowledges them through the selected HTTPS API.
+8. Runtime leases default to 24 hours. A heartbeat timeout or `POST /api/v1/client/logout` revokes them immediately and closes tracked connections.
 
 Clients that stop sending heartbeats are removed from the connected-client view after the configured timeout, their queued commands are released, and active FRP access can be terminated.
+
+If an Edge loses its Controller connection, new resource-policy and bootstrap requests return `edge_controller_disconnected`. Existing FRP leases remain locally valid, and a running Client receives one `show_warning` per outage.
 
 ## API Groups
 
@@ -164,6 +182,7 @@ Clients that stop sending heartbeats are removed from the connected-client view 
 - `/api/v1/admin/tokens*`: API tokens, rotation, bans, and grants
 - `/api/v1/admin/clients*`: device history, bans, deletion, and commands
 - `/api/v1/admin/dpi-*`: DPI policies and detection events
+- `/api/v1/admin/edge-clients`, `/api/v1/admin/nodes/{id}/commands`: aggregated Edge clients and Controller commands
 - `/api/v1/admin/connections*`: active connections and termination
 - `/api/v1/admin/blocked-ips*`: inbound-IP block list
 - `/api/v1/client/*`: policy, bootstrap, heartbeat, and logout

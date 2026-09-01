@@ -4,7 +4,9 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
+	"frp-control-server/internal/cluster"
 	"frp-control-server/internal/config"
 	"frp-control-server/internal/db"
 	"frp-control-server/internal/security"
@@ -19,6 +21,14 @@ type adminLoginToken struct {
 func (s *Server) bootstrapState(w http.ResponseWriter, r *http.Request) {
 	store := s.getStore()
 	cfg := s.getConfig()
+	if cfg.ConfigState == "unconfigured" || cfg.ConfigState == "invalid" {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "initialized": false, "setup_required": true, "database_ready": false, "database_error": false, "repair_required": false, "config_state": cfg.ConfigState, "config_error": cfg.ConfigError, "mode": "", "config_path": cfg.ConfigPath})
+		return
+	}
+	if cfg.Mode == config.ModeEdge {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "initialized": cfg.Initialized, "setup_required": !cfg.Initialized, "database_ready": s.edgeState != nil, "database_error": false, "repair_required": false, "config_state": cfg.ConfigState, "mode": cfg.Mode, "config_path": cfg.ConfigPath})
+		return
+	}
 	if store == nil {
 		initialized := cfg.Initialized
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -94,6 +104,17 @@ func (s *Server) setupAdmin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "system already initialized")
 		return
 	}
+	if cfg.ConfigState == "invalid" {
+		if _, err := config.PreserveInvalidFile(cfg.ConfigPath); err != nil {
+			writeError(w, 500, "preserve invalid config failed: "+err.Error())
+			return
+		}
+	}
+	cfg.Mode = config.ModeController
+	cfg.ConfigVersion = 2
+	cfg.ConfigState = "configured"
+	cfg.ConfigError = ""
+	initializeNodeRuntimeFromRequest(&cfg, r, "中心节点")
 	store := s.getStore()
 	if needsDatabaseSetup(store, req.Database) {
 		if err := validateDatabaseSetup(req.Database); err != nil {
@@ -174,7 +195,7 @@ func (s *Server) setupAdmin(w http.ResponseWriter, r *http.Request) {
 		"expires_at":       loginToken.ExpiresAt,
 		"expires_in":       loginToken.ExpiresIn,
 		"config_path":      cfg.ConfigPath,
-		"restart_required": false,
+		"restart_required": true,
 	})
 }
 
@@ -248,14 +269,29 @@ type loginRequest struct {
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	store := s.getStore()
-	if store == nil {
-		writeError(w, http.StatusServiceUnavailable, "system setup required")
-		return
-	}
 	var req loginRequest
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	cfg := s.getConfig()
+	if cfg.Mode == config.ModeEdge {
+		if strings.TrimSpace(req.Username) != cfg.InitialAdmin.Username || !security.CheckPassword(cfg.InitialAdmin.PasswordHash, req.Password) {
+			writeError(w, http.StatusUnauthorized, "invalid username or password")
+			return
+		}
+		user := &db.User{ID: 1, Username: cfg.InitialAdmin.Username, DisplayName: cfg.InitialAdmin.DisplayName, Role: "admin", Status: "active"}
+		loginToken, err := s.issueEdgeAdminBrowserToken(w, user)
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "user": user, "admin_token": loginToken.Token, "expires_at": loginToken.ExpiresAt, "expires_in": loginToken.ExpiresIn})
+		return
+	}
+	store := s.getStore()
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "system setup required")
 		return
 	}
 	user, err := store.GetUserByUsername(r.Context(), strings.TrimSpace(req.Username))
@@ -318,9 +354,21 @@ func validateDatabaseSetup(database config.DatabaseSetup) error {
 
 func (s *Server) getSystemSettings(w http.ResponseWriter, r *http.Request) {
 	cfg := s.getConfig()
+	nodeSettings := cfg.Node
+	if strings.TrimSpace(nodeSettings.Tag) == "" {
+		if cfg.Mode == config.ModeEdge && strings.TrimSpace(cfg.Edge.NodeName) != "" {
+			nodeSettings.Tag = cfg.Edge.NodeName
+		} else {
+			nodeSettings.Tag = "中心节点"
+		}
+	}
+	if strings.TrimSpace(nodeSettings.PublicAPIURL) == "" {
+		nodeSettings.PublicAPIURL = externalRequestBaseURL(r)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true,
 		"settings": map[string]any{
+			"mode":                  cfg.Mode,
 			"embedded_frps_enabled": cfg.EmbeddedFRPEnabled,
 			"frp_bind_addr":         cfg.FRPBindAddr,
 			"frp_proxy_bind_addr":   cfg.FRPProxyBindAddr,
@@ -331,20 +379,28 @@ func (s *Server) getSystemSettings(w http.ResponseWriter, r *http.Request) {
 			"session_ttl":           cfg.SessionTTL.String(),
 			"udp_connection_ttl":    cfg.UDPConnectionTTL.String(),
 			"config_path":           cfg.ConfigPath,
+			"node":                  nodeSettings,
+			"controller":            map[string]any{"edge_access_enabled": cfg.Controller.EdgeAccessEnabled, "listen_addr": cfg.Controller.ListenAddr, "public_address": cfg.Controller.PublicAddress, "heartbeat_interval_seconds": cfg.Controller.HeartbeatIntervalSeconds, "pki_configured": cfg.Controller.TLS.CACertificateBase64 != "" || cfg.Controller.TLS.CAFile != ""},
+			"edge":                  map[string]any{"node_id": cfg.Edge.NodeID, "node_name": cfg.Edge.NodeName, "controller_address": cfg.Edge.ControllerAddr, "server_name": cfg.Edge.ServerName, "state_path": cfg.Edge.StatePath, "controller_administration_enabled": cfg.Edge.ControllerAdministrationEnabled, "reporting": cfg.Edge.Reporting, "remote_commands": cfg.Edge.RemoteCommands, "mtls_configured": cfg.Edge.TLS.CACertificateBase64 != "" || cfg.Edge.TLS.CAFile != ""},
 		},
 	})
 }
 
 type updateSystemSettingsRequest struct {
-	EmbeddedFRPEnabled  *bool  `json:"embedded_frps_enabled"`
-	FRPBindAddr         string `json:"frp_bind_addr"`
-	FRPProxyBindAddr    string `json:"frp_proxy_bind_addr"`
-	FRPServerAddr       string `json:"frp_server_addr"`
-	FRPServerPort       int    `json:"frp_server_port"`
-	FRPTransportTLS     bool   `json:"frp_transport_tls"`
-	ClientConfigComment string `json:"client_config_comment"`
-	SessionTTL          string `json:"session_ttl"`
-	UDPConnectionTTL    string `json:"udp_connection_ttl"`
+	EmbeddedFRPEnabled              *bool                            `json:"embedded_frps_enabled"`
+	FRPBindAddr                     string                           `json:"frp_bind_addr"`
+	FRPProxyBindAddr                string                           `json:"frp_proxy_bind_addr"`
+	FRPServerAddr                   string                           `json:"frp_server_addr"`
+	FRPServerPort                   int                              `json:"frp_server_port"`
+	FRPTransportTLS                 bool                             `json:"frp_transport_tls"`
+	ClientConfigComment             string                           `json:"client_config_comment"`
+	SessionTTL                      string                           `json:"session_ttl"`
+	UDPConnectionTTL                string                           `json:"udp_connection_ttl"`
+	Controller                      *config.ControllerConfig         `json:"controller,omitempty"`
+	Node                            *config.NodeRuntimeConfig        `json:"node,omitempty"`
+	Reporting                       *config.EdgeReportingConfig      `json:"reporting,omitempty"`
+	RemoteCommands                  *config.EdgeRemoteCommandsConfig `json:"remote_commands,omitempty"`
+	ControllerAdministrationEnabled *bool                            `json:"controller_administration_enabled,omitempty"`
 }
 
 func (s *Server) updateSystemSettings(w http.ResponseWriter, r *http.Request) {
@@ -353,17 +409,64 @@ func (s *Server) updateSystemSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	cfg := s.getConfig()
+	oldCfg := cfg
+	if cfg.Mode == config.ModeEdge {
+		if req.Node != nil {
+			node := normalizeNodeRuntime(*req.Node)
+			if err := validateNodeRuntime(node); err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			cfg.Node = node
+			syncLegacyFRPFields(&cfg)
+		}
+		if req.Reporting != nil {
+			cfg.Edge.Reporting = *req.Reporting
+		}
+		if req.RemoteCommands != nil {
+			cfg.Edge.RemoteCommands = *req.RemoteCommands
+		}
+		if req.ControllerAdministrationEnabled != nil {
+			cfg.Edge.ControllerAdministrationEnabled = *req.ControllerAdministrationEnabled
+		}
+		if err := config.WriteFileConfig(cfg.ConfigPath, cfg.FileConfig()); err != nil {
+			writeError(w, 500, "write config failed: "+err.Error())
+			return
+		}
+		s.setRuntime(cfg, s.getStore())
+		if s.edgeClient != nil {
+			s.edgeClient.SetCapabilities(edgeCapabilities(cfg))
+		}
+		restartRequired := oldCfg.Node.FRPBindPort != cfg.Node.FRPBindPort
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restart_required": restartRequired})
+		return
+	}
+	if req.Node != nil {
+		node := normalizeNodeRuntime(*req.Node)
+		if err := validateNodeRuntime(node); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		cfg.Node = node
+		syncLegacyFRPFields(&cfg)
+	} else {
+		// Accept the legacy settings request during rolling upgrades.
+		cfg.Node.FRPAdvertiseAddr = strings.TrimSpace(req.FRPServerAddr)
+		cfg.Node.FRPBindPort = req.FRPServerPort
+		syncLegacyFRPFields(&cfg)
+	}
 	req.FRPServerAddr = strings.TrimSpace(req.FRPServerAddr)
 	req.FRPBindAddr = strings.TrimSpace(req.FRPBindAddr)
 	req.FRPProxyBindAddr = strings.TrimSpace(req.FRPProxyBindAddr)
 	req.ClientConfigComment = strings.TrimSpace(req.ClientConfigComment)
 	req.SessionTTL = strings.TrimSpace(req.SessionTTL)
 	req.UDPConnectionTTL = strings.TrimSpace(req.UDPConnectionTTL)
-	if req.FRPServerAddr == "" {
+	if cfg.FRPServerAddr == "" {
 		writeError(w, http.StatusBadRequest, "frp_server_addr is required")
 		return
 	}
-	if req.FRPServerPort <= 0 || req.FRPServerPort > 65535 {
+	if cfg.FRPServerPort <= 0 || cfg.FRPServerPort > 65535 {
 		writeError(w, http.StatusBadRequest, "frp_server_port is invalid")
 		return
 	}
@@ -385,8 +488,6 @@ func (s *Server) updateSystemSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		udpConnectionTTL = parsed
 	}
-	cfg := s.getConfig()
-	oldCfg := cfg
 	if req.EmbeddedFRPEnabled != nil {
 		cfg.EmbeddedFRPEnabled = *req.EmbeddedFRPEnabled
 	}
@@ -396,13 +497,41 @@ func (s *Server) updateSystemSettings(w http.ResponseWriter, r *http.Request) {
 	if req.FRPProxyBindAddr != "" {
 		cfg.FRPProxyBindAddr = req.FRPProxyBindAddr
 	}
-	cfg.FRPServerAddr = req.FRPServerAddr
-	cfg.FRPServerPort = req.FRPServerPort
+	// FRPServerAddr/FRPServerPort were synchronized from cfg.Node above.
 	cfg.FRPTransportTLS = req.FRPTransportTLS
 	cfg.SessionTTL = sessionTTL
 	cfg.UDPConnectionTTL = udpConnectionTTL
 	if req.ClientConfigComment != "" {
 		cfg.ClientConfigComment = req.ClientConfigComment
+	}
+	if req.Controller != nil {
+		cfg.Controller.EdgeAccessEnabled = req.Controller.EdgeAccessEnabled
+		if strings.TrimSpace(req.Controller.ListenAddr) != "" {
+			cfg.Controller.ListenAddr = strings.TrimSpace(req.Controller.ListenAddr)
+		}
+		if strings.TrimSpace(req.Controller.PublicAddress) != "" {
+			cfg.Controller.PublicAddress = cluster.NormalizeControllerAddress(req.Controller.PublicAddress)
+		}
+		if req.Controller.HeartbeatIntervalSeconds != 0 {
+			if req.Controller.HeartbeatIntervalSeconds < 2 || req.Controller.HeartbeatIntervalSeconds > 60 {
+				writeError(w, 400, "heartbeat interval must be between 2 and 60 seconds")
+				return
+			}
+			cfg.Controller.HeartbeatIntervalSeconds = req.Controller.HeartbeatIntervalSeconds
+		}
+		if cfg.Controller.EdgeAccessEnabled {
+			if cfg.Controller.PublicAddress == "" {
+				writeError(w, http.StatusBadRequest, "controller public_address is required when edge access is enabled")
+				return
+			}
+			if err := ensureControllerPKI(&cfg); err != nil {
+				writeError(w, 500, "prepare controller PKI failed: "+err.Error())
+				return
+			}
+		}
+	}
+	if s.controllerControl != nil {
+		s.controllerControl.SetHeartbeatInterval(cfg.Controller.HeartbeatIntervalSeconds)
 	}
 	if err := config.WriteFileConfig(cfg.ConfigPath, cfg.FileConfig()); err != nil {
 		writeError(w, http.StatusInternalServerError, "write config failed: "+err.Error())
@@ -417,8 +546,18 @@ func (s *Server) updateSystemSettings(w http.ResponseWriter, r *http.Request) {
 		oldCfg.FRPBindAddr != cfg.FRPBindAddr ||
 		oldCfg.FRPProxyBindAddr != cfg.FRPProxyBindAddr ||
 		oldCfg.FRPServerPort != cfg.FRPServerPort ||
-		oldCfg.FRPTransportTLS != cfg.FRPTransportTLS
+		oldCfg.FRPTransportTLS != cfg.FRPTransportTLS || oldCfg.Controller.EdgeAccessEnabled != cfg.Controller.EdgeAccessEnabled || oldCfg.Controller.ListenAddr != cfg.Controller.ListenAddr
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restart_required": restartRequired})
+}
+
+func (s *Server) issueEdgeAdminBrowserToken(w http.ResponseWriter, user *db.User) (adminLoginToken, error) {
+	cfg := s.getConfig()
+	token, expiresAt, err := security.NewAdminBrowserToken(user.ID, cfg.InitialAdmin.PasswordHash, cfg.CookieSecret, cfg.SessionTTL)
+	if err != nil {
+		return adminLoginToken{}, err
+	}
+	setAdminTokenCookie(w, token, expiresAt)
+	return adminLoginToken{Token: token, ExpiresAt: expiresAt.Format(time.RFC3339), ExpiresIn: int64(cfg.SessionTTL.Seconds())}, nil
 }
 
 func (s *Server) issueAdminBrowserToken(r *http.Request, w http.ResponseWriter, user *db.User) (adminLoginToken, error) {
