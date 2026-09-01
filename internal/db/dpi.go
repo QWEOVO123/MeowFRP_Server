@@ -14,6 +14,7 @@ import (
 
 type DPIEvent struct {
 	ID         int64     `json:"id"`
+	NodeID     string    `json:"node_id,omitempty"`
 	UserID     int64     `json:"user_id"`
 	Username   string    `json:"username"`
 	TokenID    int64     `json:"token_id"`
@@ -34,6 +35,11 @@ type DPIEvent struct {
 	Reason     string    `json:"reason"`
 	Summary    string    `json:"summary"`
 	CreatedAt  time.Time `json:"created_at"`
+}
+
+func (s *Store) RecordEdgeDPIEvent(ctx context.Context, nodeID string, event dpi.Event) error {
+	_, err := s.db.ExecContext(ctx, `INSERT INTO dpi_events(node_id,user_id,token_id,client_id,lease_id,proxy_name,proxy_type,remote_port,local_addr,remote_addr,direction,detector,protocol,host,sni,target_ip,action,reason,summary,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,NULLIF(?,''),NULLIF(?,''),NULLIF(?,''),?,?,?,?)`, nodeID, event.Flow.UserID, event.Flow.TokenID, event.Flow.ClientID, event.Flow.LeaseID, event.Flow.ProxyName, event.Flow.ProxyType, event.Flow.RemotePort, event.Flow.LocalAddr, event.Flow.RemoteAddr, event.Direction, event.Finding.Detector, event.Finding.Protocol, event.Finding.Host, event.Finding.SNI, event.Finding.TargetIP, event.Action, event.Reason, event.Finding.Summary, event.ObservedAt)
+	return err
 }
 
 func (s *Store) GetPolicy(ctx context.Context, flow dpiengine.FlowContext) (dpi.Policy, error) {
@@ -147,7 +153,7 @@ func (s *Store) ListDPIEvents(ctx context.Context, limit int) ([]DPIEvent, error
 		limit = 100
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT e.id, e.user_id, COALESCE(u.username, ''), e.token_id, e.client_id, e.lease_id,
+		SELECT e.id, e.node_id, e.user_id, COALESCE(u.username, ''), e.token_id, e.client_id, e.lease_id,
 		       e.proxy_name, e.proxy_type, e.remote_port, e.local_addr, e.remote_addr,
 		       e.direction, e.detector, e.protocol, COALESCE(e.host, ''), COALESCE(e.sni, ''),
 		       COALESCE(e.target_ip, ''), e.action, e.reason, e.summary, e.created_at
@@ -164,7 +170,7 @@ func (s *Store) ListDPIEvents(ctx context.Context, limit int) ([]DPIEvent, error
 	for rows.Next() {
 		var event DPIEvent
 		if err := rows.Scan(
-			&event.ID, &event.UserID, &event.Username, &event.TokenID, &event.ClientID, &event.LeaseID,
+			&event.ID, &event.NodeID, &event.UserID, &event.Username, &event.TokenID, &event.ClientID, &event.LeaseID,
 			&event.ProxyName, &event.ProxyType, &event.RemotePort, &event.LocalAddr, &event.RemoteAddr,
 			&event.Direction, &event.Detector, &event.Protocol, &event.Host, &event.SNI,
 			&event.TargetIP, &event.Action, &event.Reason, &event.Summary, &event.CreatedAt,

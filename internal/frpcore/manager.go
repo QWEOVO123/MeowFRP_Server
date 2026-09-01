@@ -63,6 +63,15 @@ type BlockedInboundIP struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+type TrafficSnapshot struct {
+	BytesInbound    uint64    `json:"bytes_inbound"`
+	BytesOutbound   uint64    `json:"bytes_outbound"`
+	SamplesInbound  uint64    `json:"samples_inbound"`
+	SamplesOutbound uint64    `json:"samples_outbound"`
+	StartedAt       time.Time `json:"started_at"`
+	CapturedAt      time.Time `json:"captured_at"`
+}
+
 type activeTCPConnection struct {
 	ActiveConnection
 	userConn net.Conn
@@ -78,6 +87,7 @@ type Manager struct {
 	tcpConnections       map[string]*activeTCPConnection
 	udpFlows             map[string]ActiveConnection
 	blockedInboundIPs    map[string]BlockedInboundIP
+	traffic              TrafficSnapshot
 	nextConnectionID     uint64
 	udpFlowTimeout       time.Duration
 	maxUDPFlows          int
@@ -95,6 +105,7 @@ func NewManager(inspector Inspector) *Manager {
 		tcpConnections:       map[string]*activeTCPConnection{},
 		udpFlows:             map[string]ActiveConnection{},
 		blockedInboundIPs:    map[string]BlockedInboundIP{},
+		traffic:              TrafficSnapshot{StartedAt: time.Now().UTC()},
 		udpFlowTimeout:       defaultUDPFlowTimeout,
 		maxUDPFlows:          maxTrackedUDPFlows,
 		cleanupStop:          make(chan struct{}),
@@ -452,7 +463,21 @@ func (m *Manager) clearTrackedConnections() []*activeTCPConnection {
 }
 
 func (m *Manager) FeedTrafficSample(ctx context.Context, sample dpiengine.TrafficSample) dpi.Decision {
-	m.mu.RLock()
+	payloadLength := sample.PayloadLength
+	if payloadLength <= 0 {
+		payloadLength = len(sample.Payload)
+	}
+	m.mu.Lock()
+	if payloadLength > 0 {
+		switch sample.Direction {
+		case dpiengine.DirectionInbound:
+			m.traffic.BytesInbound += uint64(payloadLength)
+			m.traffic.SamplesInbound++
+		case dpiengine.DirectionOutbound:
+			m.traffic.BytesOutbound += uint64(payloadLength)
+			m.traffic.SamplesOutbound++
+		}
+	}
 	inspector := m.inspector
 	if sample.Flow.UserID == 0 && sample.Flow.LeaseID != "" && sample.Flow.ProxyName != "" {
 		if binding, ok := m.bindings[bindingKey(sample.Flow.LeaseID, sample.Flow.ProxyName)]; ok {
@@ -465,11 +490,19 @@ func (m *Manager) FeedTrafficSample(ctx context.Context, sample dpiengine.Traffi
 			}
 		}
 	}
-	m.mu.RUnlock()
+	m.mu.Unlock()
 	if inspector == nil {
 		return dpi.Allow()
 	}
 	return inspector.Inspect(ctx, sample)
+}
+
+func (m *Manager) TrafficSnapshot() TrafficSnapshot {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	snapshot := m.traffic
+	snapshot.CapturedAt = time.Now().UTC()
+	return snapshot
 }
 
 func (m *Manager) bindingForLocked(leaseID, proxyName string) ProxyBinding {

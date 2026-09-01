@@ -2,7 +2,7 @@
   "mysql_dsn": "frp_control:change-me@tcp(127.0.0.1:3306)/frp_control?parseTime=true&multiStatements=true&charset=utf8mb4,utf8",
   "cookie_secret": "replace-with-a-random-secret",
   "session_ttl": "1h",
-  "runtime_token_ttl": "1h",
+  "runtime_token_ttl": "24h",
   "udp_connection_ttl": "10s",
   "embedded_frps_enabled": true,
   "frp_bind_addr": "0.0.0.0",

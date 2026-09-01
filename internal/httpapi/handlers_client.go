@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"frp-control-server/internal/config"
 	"frp-control-server/internal/db"
 	dpipolicy "frp-control-server/internal/dpi"
 	"frp-control-server/internal/policy"
@@ -35,6 +36,10 @@ type clientDPISummary struct {
 }
 
 func (s *Server) clientResourcePolicy(w http.ResponseWriter, r *http.Request) {
+	if s.getConfig().Mode == config.ModeEdge {
+		s.edgeClientResourcePolicy(w, r)
+		return
+	}
 	store := s.getStore()
 	if store == nil {
 		writeError(w, http.StatusServiceUnavailable, "system setup required")
@@ -59,11 +64,16 @@ func (s *Server) clientResourcePolicy(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if err := store.TouchClientHeartbeat(r.Context(), client.ID); err != nil {
+	if err := store.TouchClientHeartbeat(r.Context(), client.ID, client.FRPCRunning); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	cfg := s.getConfig()
+	policy, rangeAvailable := intersectNodePortRange(policy, cfg)
+	if !rangeAvailable {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "status": "rejected", "reason": "node and user port ranges do not overlap"})
+		return
+	}
 	dpiSummary := clientDPIStatus(r.Context(), store, user.ID)
 	store.Audit(r.Context(), "client", client.ID, "resource_policy", "token", fmt.Sprintf("%d", token.ID), "")
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -147,6 +157,10 @@ func dpiTypeAllowed(policy dpipolicy.Policy, trafficType string) bool {
 }
 
 func (s *Server) clientBootstrap(w http.ResponseWriter, r *http.Request) {
+	if s.getConfig().Mode == config.ModeEdge {
+		s.edgeClientBootstrap(w, r)
+		return
+	}
 	store := s.getStore()
 	if store == nil {
 		writeError(w, http.StatusServiceUnavailable, "system setup required")
@@ -234,8 +248,14 @@ func (s *Server) validateBootstrapProxies(ctx context.Context, user *db.User, to
 	if token.MaxProxyCount > 0 && len(proxies) > token.MaxProxyCount {
 		return nil, fmt.Errorf("proxy count %d exceeds token limit %d", len(proxies), token.MaxProxyCount)
 	}
+	cfg := s.getConfig()
+	policy, rangeAvailable := intersectNodePortRange(policy, cfg)
+	if !rangeAvailable {
+		return nil, fmt.Errorf("node and user port ranges do not overlap")
+	}
 	grants, _ := s.store.ListPortGrants(ctx, token.ID)
 	var normalized []db.ProxyAllocationInput
+	requestedPorts := map[string]bool{}
 	for _, proxy := range proxies {
 		proxy.ProxyName = strings.TrimSpace(proxy.ProxyName)
 		proxy.ProxyType = normalizeProtocol(proxy.ProxyType)
@@ -256,6 +276,19 @@ func (s *Server) validateBootstrapProxies(ctx context.Context, user *db.User, to
 		}
 		if proxy.RemotePort < policy.PortStart || proxy.RemotePort > policy.PortEnd {
 			return nil, fmt.Errorf("remote port %d is outside user range %d-%d", proxy.RemotePort, policy.PortStart, policy.PortEnd)
+		}
+		if err := validateNodeRemotePort(cfg, proxy.RemotePort); err != nil {
+			return nil, err
+		}
+		portKey := fmt.Sprintf("%s:%d", proxy.ProxyType, proxy.RemotePort)
+		if requestedPorts[portKey] {
+			return nil, fmt.Errorf("remote port %d is duplicated in this request", proxy.RemotePort)
+		}
+		requestedPorts[portKey] = true
+		if used, err := s.store.RemotePortInUse(ctx, proxy.ProxyType, proxy.RemotePort); err != nil {
+			return nil, err
+		} else if used {
+			return nil, fmt.Errorf("remote port %d is already in use on this node", proxy.RemotePort)
 		}
 		if !matchesAnyGrant(proxy, grants) {
 			if len(grants) > 0 {

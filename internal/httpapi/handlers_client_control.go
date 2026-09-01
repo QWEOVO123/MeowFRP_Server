@@ -1,6 +1,9 @@
 package httpapi
 
 import (
+	"errors"
+	"frp-control-server/internal/config"
+	"frp-control-server/internal/db"
 	"net/http"
 	"strconv"
 	"strings"
@@ -14,12 +17,57 @@ type clientHeartbeatRequest struct {
 	LeaseID       string `json:"lease_id"`
 }
 
+func (s *Server) clientCommandACK(w http.ResponseWriter, r *http.Request) {
+	if s.getConfig().Mode == config.ModeEdge {
+		s.edgeClientCommandACK(w, r)
+		return
+	}
+	commandID, err := parseID(r)
+	if err != nil || commandID <= 0 {
+		writeError(w, http.StatusBadRequest, "invalid command id")
+		return
+	}
+	var req clientHeartbeatRequest
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.ClientID = strings.TrimSpace(req.ClientID)
+	if req.AccessToken == "" || req.ClientID == "" {
+		writeError(w, http.StatusBadRequest, "access_token and client_id are required")
+		return
+	}
+	store := s.getStore()
+	if store == nil {
+		writeError(w, http.StatusServiceUnavailable, "system setup required")
+		return
+	}
+	_, _, client, reject := s.validateExistingAccessTokenRequest(r, store, req.AccessToken, req.ClientID)
+	if reject != nil {
+		writeJSON(w, http.StatusOK, reject)
+		return
+	}
+	if err := store.AcknowledgeClientCommand(r.Context(), commandID, client.ID); err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "command not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": "acknowledged", "command_id": commandID})
+}
+
 type clientCommandRequest struct {
 	Command string `json:"command"`
 	Message string `json:"message"`
 }
 
 func (s *Server) clientHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if s.getConfig().Mode == config.ModeEdge {
+		s.edgeClientHeartbeat(w, r)
+		return
+	}
 	store := s.getStore()
 	if store == nil {
 		writeError(w, http.StatusServiceUnavailable, "system setup required")
@@ -40,7 +88,7 @@ func (s *Server) clientHeartbeat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, reject)
 		return
 	}
-	if err := store.TouchClientHeartbeat(r.Context(), client.ID); err != nil {
+	if err := store.TouchClientHeartbeat(r.Context(), client.ID, req.FRPCRunning); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -59,6 +107,10 @@ func (s *Server) clientHeartbeat(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) clientLogout(w http.ResponseWriter, r *http.Request) {
+	if s.getConfig().Mode == config.ModeEdge {
+		s.edgeClientLogout(w, r)
+		return
+	}
 	store := s.getStore()
 	if store == nil {
 		writeError(w, http.StatusServiceUnavailable, "system setup required")

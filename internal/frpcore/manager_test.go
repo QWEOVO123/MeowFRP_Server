@@ -42,6 +42,20 @@ func TestFeedTrafficSampleUsesInspector(t *testing.T) {
 	}
 }
 
+func TestTrafficSnapshotCountsBothDirections(t *testing.T) {
+	manager := NewManager(nil)
+	t.Cleanup(func() { _ = manager.Close() })
+	manager.FeedTrafficSample(context.Background(), dpiengine.TrafficSample{Direction: dpiengine.DirectionInbound, PayloadLength: 120})
+	manager.FeedTrafficSample(context.Background(), dpiengine.TrafficSample{Direction: dpiengine.DirectionOutbound, Payload: []byte("hello")})
+	snapshot := manager.TrafficSnapshot()
+	if snapshot.BytesInbound != 120 || snapshot.SamplesInbound != 1 || snapshot.BytesOutbound != 5 || snapshot.SamplesOutbound != 1 {
+		t.Fatalf("unexpected traffic snapshot: %#v", snapshot)
+	}
+	if snapshot.StartedAt.IsZero() || snapshot.CapturedAt.Before(snapshot.StartedAt) {
+		t.Fatalf("unexpected traffic timestamps: %#v", snapshot)
+	}
+}
+
 func TestProxyBindingRegistry(t *testing.T) {
 	manager := NewManager(nil)
 	t.Cleanup(func() { _ = manager.Close() })

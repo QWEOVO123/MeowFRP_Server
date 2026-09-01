@@ -12,21 +12,26 @@ import (
 	"sync"
 	"time"
 
+	"frp-control-server/internal/cluster"
 	"frp-control-server/internal/config"
 	"frp-control-server/internal/db"
 	"frp-control-server/internal/dpi"
+	"frp-control-server/internal/edgestate"
 	"frp-control-server/internal/frpcore"
 	"frp-control-server/internal/policy"
 	"frp-control-server/internal/security"
 )
 
 type Server struct {
-	mu     sync.RWMutex
-	cfg    config.Config
-	store  *db.Store
-	policy policy.Engine
-	dpi    *dpi.Service
-	core   *frpcore.Manager
+	mu                sync.RWMutex
+	cfg               config.Config
+	store             *db.Store
+	policy            policy.Engine
+	dpi               *dpi.Service
+	core              *frpcore.Manager
+	edgeState         *edgestate.Store
+	edgeClient        *cluster.EdgeClient
+	controllerControl *cluster.ControllerServer
 }
 
 type Option func(*Server)
@@ -41,6 +46,13 @@ func WithFRPCore(core *frpcore.Manager) Option {
 	return func(s *Server) {
 		s.core = core
 	}
+}
+
+func WithEdgeRuntime(state *edgestate.Store, client *cluster.EdgeClient) Option {
+	return func(s *Server) { s.edgeState = state; s.edgeClient = client }
+}
+func WithControllerControl(control *cluster.ControllerServer) Option {
+	return func(s *Server) { s.controllerControl = control }
 }
 
 func NewServer(cfg config.Config, store *db.Store, opts ...Option) *Server {
@@ -66,50 +78,68 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/v1/health", s.health)
+	mux.HandleFunc("GET /api/v1/public/nodes", s.publicNodeDirectory)
+	mux.HandleFunc("POST /api/v1/nodes/enroll", s.enrollEdgeNode)
 	mux.HandleFunc("GET /api/v1/system/bootstrap-state", s.bootstrapState)
+	mux.HandleFunc("GET /api/v1/system/capabilities", s.capabilities)
 	mux.HandleFunc("POST /api/v1/system/setup-admin", s.setupAdmin)
 	mux.HandleFunc("POST /api/v1/system/setup", s.setupAdmin)
+	mux.HandleFunc("POST /api/v1/system/setup-edge", s.setupEdge)
 	mux.HandleFunc("POST /api/v1/system/repair-database", s.repairDatabase)
 	mux.HandleFunc("POST /api/v1/auth/login", s.login)
 	mux.HandleFunc("POST /api/v1/auth/logout", s.logout)
 	mux.HandleFunc("GET /api/v1/auth/me", s.requireAdmin(s.me))
 
-	mux.HandleFunc("GET /api/v1/admin/users", s.requireAdmin(s.listUsers))
-	mux.HandleFunc("POST /api/v1/admin/users", s.requireAdmin(s.createUser))
-	mux.HandleFunc("DELETE /api/v1/admin/users/{id}", s.requireAdmin(s.deleteUser))
-	mux.HandleFunc("POST /api/v1/admin/users/{id}/ban", s.requireAdmin(s.banUser))
-	mux.HandleFunc("POST /api/v1/admin/users/{id}/unban", s.requireAdmin(s.unbanUser))
-	mux.HandleFunc("GET /api/v1/admin/user-policies", s.requireAdmin(s.listUserPolicies))
-	mux.HandleFunc("GET /api/v1/admin/users/{id}/policy", s.requireAdmin(s.getUserPolicy))
-	mux.HandleFunc("PUT /api/v1/admin/users/{id}/policy", s.requireAdmin(s.updateUserPolicy))
-	mux.HandleFunc("GET /api/v1/admin/dpi-policies", s.requireAdmin(s.listDPIPolicies))
-	mux.HandleFunc("GET /api/v1/admin/dpi-events", s.requireAdmin(s.listDPIEvents))
-	mux.HandleFunc("GET /api/v1/admin/users/{id}/dpi-policy", s.requireAdmin(s.getUserDPIPolicy))
-	mux.HandleFunc("PUT /api/v1/admin/users/{id}/dpi-policy", s.requireAdmin(s.updateUserDPIPolicy))
+	mux.HandleFunc("GET /api/v1/admin/users", s.requireControllerAdmin(s.listUsers))
+	mux.HandleFunc("POST /api/v1/admin/users", s.requireControllerAdmin(s.createUser))
+	mux.HandleFunc("DELETE /api/v1/admin/users/{id}", s.requireControllerAdmin(s.deleteUser))
+	mux.HandleFunc("POST /api/v1/admin/users/{id}/ban", s.requireControllerAdmin(s.banUser))
+	mux.HandleFunc("POST /api/v1/admin/users/{id}/unban", s.requireControllerAdmin(s.unbanUser))
+	mux.HandleFunc("GET /api/v1/admin/user-policies", s.requireControllerAdmin(s.listUserPolicies))
+	mux.HandleFunc("GET /api/v1/admin/users/{id}/policy", s.requireControllerAdmin(s.getUserPolicy))
+	mux.HandleFunc("PUT /api/v1/admin/users/{id}/policy", s.requireControllerAdmin(s.updateUserPolicy))
+	mux.HandleFunc("GET /api/v1/admin/dpi-policies", s.requireControllerAdmin(s.listDPIPolicies))
+	mux.HandleFunc("GET /api/v1/admin/dpi-events", s.requireControllerAdmin(s.listDPIEvents))
+	mux.HandleFunc("GET /api/v1/admin/users/{id}/dpi-policy", s.requireControllerAdmin(s.getUserDPIPolicy))
+	mux.HandleFunc("PUT /api/v1/admin/users/{id}/dpi-policy", s.requireControllerAdmin(s.updateUserDPIPolicy))
 
-	mux.HandleFunc("GET /api/v1/admin/tokens", s.requireAdmin(s.listTokens))
-	mux.HandleFunc("POST /api/v1/admin/tokens", s.requireAdmin(s.createToken))
-	mux.HandleFunc("POST /api/v1/admin/tokens/{id}/rotate", s.requireAdmin(s.rotateToken))
-	mux.HandleFunc("POST /api/v1/admin/tokens/{id}/ban", s.requireAdmin(s.banToken))
-	mux.HandleFunc("POST /api/v1/admin/tokens/{id}/unban", s.requireAdmin(s.unbanToken))
-	mux.HandleFunc("GET /api/v1/admin/tokens/{id}/grants", s.requireAdmin(s.listGrants))
-	mux.HandleFunc("POST /api/v1/admin/tokens/{id}/grants", s.requireAdmin(s.createGrant))
-	mux.HandleFunc("GET /api/v1/admin/clients", s.requireAdmin(s.listClients))
-	mux.HandleFunc("GET /api/v1/admin/connected-clients", s.requireAdmin(s.listConnectedClients))
-	mux.HandleFunc("DELETE /api/v1/admin/clients/{id}", s.requireAdmin(s.deleteClient))
-	mux.HandleFunc("POST /api/v1/admin/clients/{id}/ban", s.requireAdmin(s.banClient))
-	mux.HandleFunc("POST /api/v1/admin/clients/{id}/unban", s.requireAdmin(s.unbanClient))
-	mux.HandleFunc("POST /api/v1/admin/clients/{id}/commands", s.requireAdmin(s.enqueueClientCommand))
-	mux.HandleFunc("GET /api/v1/admin/connections", s.requireAdmin(s.listConnections))
-	mux.HandleFunc("POST /api/v1/admin/connections/{id}/disconnect", s.requireAdmin(s.disconnectConnection))
-	mux.HandleFunc("POST /api/v1/admin/blocked-ips", s.requireAdmin(s.blockInboundIP))
-	mux.HandleFunc("DELETE /api/v1/admin/blocked-ips/{ip}", s.requireAdmin(s.unblockInboundIP))
+	mux.HandleFunc("GET /api/v1/admin/tokens", s.requireControllerAdmin(s.listTokens))
+	mux.HandleFunc("POST /api/v1/admin/tokens", s.requireControllerAdmin(s.createToken))
+	mux.HandleFunc("POST /api/v1/admin/tokens/{id}/rotate", s.requireControllerAdmin(s.rotateToken))
+	mux.HandleFunc("POST /api/v1/admin/tokens/{id}/ban", s.requireControllerAdmin(s.banToken))
+	mux.HandleFunc("POST /api/v1/admin/tokens/{id}/unban", s.requireControllerAdmin(s.unbanToken))
+	mux.HandleFunc("GET /api/v1/admin/tokens/{id}/grants", s.requireControllerAdmin(s.listGrants))
+	mux.HandleFunc("POST /api/v1/admin/tokens/{id}/grants", s.requireControllerAdmin(s.createGrant))
+	mux.HandleFunc("GET /api/v1/admin/clients", s.requireControllerAdmin(s.listClients))
+	mux.HandleFunc("GET /api/v1/admin/connected-clients", s.requireControllerAdmin(s.listConnectedClients))
+	mux.HandleFunc("DELETE /api/v1/admin/clients/{id}", s.requireControllerAdmin(s.deleteClient))
+	mux.HandleFunc("POST /api/v1/admin/clients/{id}/ban", s.requireControllerAdmin(s.banClient))
+	mux.HandleFunc("POST /api/v1/admin/clients/{id}/unban", s.requireControllerAdmin(s.unbanClient))
+	mux.HandleFunc("POST /api/v1/admin/clients/{id}/commands", s.requireControllerAdmin(s.enqueueClientCommand))
+	mux.HandleFunc("GET /api/v1/admin/connections", s.requireControllerAdmin(s.listConnections))
+	mux.HandleFunc("POST /api/v1/admin/connections/{id}/disconnect", s.requireControllerAdmin(s.disconnectConnection))
+	mux.HandleFunc("POST /api/v1/admin/blocked-ips", s.requireControllerAdmin(s.blockInboundIP))
+	mux.HandleFunc("DELETE /api/v1/admin/blocked-ips/{ip}", s.requireControllerAdmin(s.unblockInboundIP))
 	mux.HandleFunc("GET /api/v1/admin/system-settings", s.requireAdmin(s.getSystemSettings))
 	mux.HandleFunc("PUT /api/v1/admin/system-settings", s.requireAdmin(s.updateSystemSettings))
+	mux.HandleFunc("GET /api/v1/admin/nodes", s.requireControllerAdmin(s.listEdgeNodes))
+	mux.HandleFunc("PUT /api/v1/admin/nodes/{id}", s.requireControllerAdmin(s.updateEdgeNode))
+	mux.HandleFunc("PUT /api/v1/admin/nodes/{id}/remote-permissions", s.requireControllerAdmin(s.updateEdgeRemotePermissions))
+	mux.HandleFunc("PUT /api/v1/admin/nodes/{id}/runtime-settings", s.requireControllerAdmin(s.updateEdgeRuntimeSettings))
+	mux.HandleFunc("POST /api/v1/admin/nodes/{id}/admin-credentials", s.requireControllerAdmin(s.rotateEdgeAdminCredentials))
+	mux.HandleFunc("POST /api/v1/admin/nodes/{id}/commands", s.requireControllerAdmin(s.createEdgeCommand))
+	mux.HandleFunc("GET /api/v1/admin/edge-clients", s.requireControllerAdmin(s.listEdgeClients))
+	mux.HandleFunc("GET /api/v1/admin/edge-connections", s.requireControllerAdmin(s.listEdgeConnections))
+	mux.HandleFunc("GET /api/v1/admin/edge-traffic", s.requireControllerAdmin(s.listEdgeTraffic))
+	mux.HandleFunc("GET /api/v1/admin/edge-runtime-logs", s.requireControllerAdmin(s.listEdgeRuntimeLogs))
+	mux.HandleFunc("POST /api/v1/admin/nodes/enrollment-tokens", s.requireControllerAdmin(s.createNodeEnrollmentToken))
+	mux.HandleFunc("GET /api/v1/admin/edge/status", s.requireAdmin(s.edgeStatus))
+	mux.HandleFunc("POST /api/v1/admin/edge/re-enroll", s.requireAdmin(s.reEnrollEdge))
 
 	mux.HandleFunc("POST /api/v1/client/bootstrap", s.clientBootstrap)
 	mux.HandleFunc("POST /api/v1/client/resource-policy", s.clientResourcePolicy)
 	mux.HandleFunc("POST /api/v1/client/heartbeat", s.clientHeartbeat)
+	mux.HandleFunc("POST /api/v1/client/commands/{id}/ack", s.clientCommandACK)
 	mux.HandleFunc("POST /api/v1/client/logout", s.clientLogout)
 	mux.HandleFunc("POST /api/v1/frp/plugin", s.frpPlugin)
 
@@ -139,6 +169,27 @@ func (s *Server) StartClientHeartbeatWatchdog(ctx context.Context) {
 }
 
 func (s *Server) enforceClientHeartbeatTimeout(ctx context.Context) error {
+	if s.edgeState != nil {
+		clients, err := s.edgeState.StaleClients(ctx, time.Now().Add(-clientHeartbeatTimeout))
+		if err != nil {
+			return err
+		}
+		for _, client := range clients {
+			if err := s.edgeState.RevokeClient(ctx, client.TokenID, client.ClientID); err != nil {
+				return err
+			}
+			if _, err := s.edgeState.DeleteUnacknowledgedClientCommands(ctx, client.ID); err != nil {
+				return err
+			}
+			if err := s.edgeState.ClearClient(ctx, client.ID); err != nil {
+				return err
+			}
+			if s.core != nil {
+				s.core.TerminateConnectionsForClient(client.TokenID, client.ClientID)
+			}
+		}
+		return nil
+	}
 	store := s.getStore()
 	if store == nil {
 		return nil
@@ -198,6 +249,28 @@ const adminTokenCookieName = "frp_control_admin_token"
 
 func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		cfg := s.getConfig()
+		if cfg.Mode == config.ModeEdge {
+			tokenValue := bearerToken(r)
+			if tokenValue == "" {
+				if cookie, err := r.Cookie(adminTokenCookieName); err == nil {
+					tokenValue = cookie.Value
+				}
+			}
+			if tokenValue == "" {
+				writeError(w, http.StatusUnauthorized, "not logged in")
+				return
+			}
+			userID, _, err := security.ParseAdminBrowserToken(tokenValue, cfg.InitialAdmin.PasswordHash, cfg.CookieSecret)
+			if err != nil || userID != 1 {
+				writeError(w, http.StatusUnauthorized, "invalid admin token")
+				return
+			}
+			user := &db.User{ID: 1, Username: cfg.InitialAdmin.Username, DisplayName: cfg.InitialAdmin.DisplayName, Role: "admin", Status: "active"}
+			r = r.WithContext(context.WithValue(r.Context(), userContextKey, user))
+			next(w, r)
+			return
+		}
 		store := s.getStore()
 		if store == nil {
 			writeError(w, http.StatusServiceUnavailable, "system setup required")
@@ -236,6 +309,16 @@ func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 		r = r.WithContext(context.WithValue(r.Context(), userContextKey, user))
 		next(w, r)
 	}
+}
+
+func (s *Server) requireControllerAdmin(next http.HandlerFunc) http.HandlerFunc {
+	return s.requireAdmin(func(w http.ResponseWriter, r *http.Request) {
+		if s.getConfig().Mode != config.ModeController {
+			writeError(w, http.StatusForbidden, "controller mode is required")
+			return
+		}
+		next(w, r)
+	})
 }
 
 func (s *Server) getConfig() config.Config {
@@ -329,6 +412,7 @@ func setAdminTokenCookie(w http.ResponseWriter, token string, expiresAt time.Tim
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   true,
 		SameSite: http.SameSiteLaxMode,
 		Expires:  expiresAt,
 	})
@@ -340,6 +424,7 @@ func clearAdminTokenCookie(w http.ResponseWriter) {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   true,
 		SameSite: http.SameSiteLaxMode,
 		Expires:  time.Unix(0, 0),
 		MaxAge:   -1,
@@ -349,6 +434,7 @@ func clearAdminTokenCookie(w http.ResponseWriter) {
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   true,
 		SameSite: http.SameSiteLaxMode,
 		Expires:  time.Unix(0, 0),
 		MaxAge:   -1,

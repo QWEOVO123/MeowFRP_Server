@@ -98,14 +98,15 @@ type UserResourcePolicy struct {
 }
 
 type Client struct {
-	ID         int64      `json:"id"`
-	UserID     int64      `json:"user_id"`
-	TokenID    int64      `json:"token_id"`
-	ClientID   string     `json:"client_id"`
-	Status     string     `json:"status"`
-	BanReason  string     `json:"ban_reason,omitempty"`
-	FrpcAddr   string     `json:"frpc_addr"`
-	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
+	ID          int64      `json:"id"`
+	UserID      int64      `json:"user_id"`
+	TokenID     int64      `json:"token_id"`
+	ClientID    string     `json:"client_id"`
+	Status      string     `json:"status"`
+	BanReason   string     `json:"ban_reason,omitempty"`
+	FrpcAddr    string     `json:"frpc_addr"`
+	FRPCRunning bool       `json:"frpc_running"`
+	LastSeenAt  *time.Time `json:"last_seen_at,omitempty"`
 }
 
 type RuntimeLease struct {
@@ -148,16 +149,16 @@ func (s *Store) Migrate(ctx context.Context) error {
 		}
 	}
 	for _, statement := range schemaMigrationStatements {
-		if _, err := s.db.ExecContext(ctx, statement); err != nil && !isDuplicateColumnError(err) {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil && !isDuplicateMigrationError(err) {
 			return err
 		}
 	}
 	return nil
 }
 
-func isDuplicateColumnError(err error) bool {
+func isDuplicateMigrationError(err error) bool {
 	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "duplicate column") || strings.Contains(message, "1060")
+	return strings.Contains(message, "duplicate column") || strings.Contains(message, "duplicate key name") || strings.Contains(message, "1060") || strings.Contains(message, "1061")
 }
 
 func JoinProtocols(protocols []string) string {
@@ -568,9 +569,37 @@ func (s *Store) ListPortGrants(ctx context.Context, tokenID int64) ([]PortGrant,
 	return grants, rows.Err()
 }
 
+func (s *Store) ListAllPortGrants(ctx context.Context) ([]PortGrant, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id,token_id,protocol,remote_port_start,remote_port_end,max_count,COALESCE(domain,''),COALESCE(subdomain,''),enabled FROM token_port_grants ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var grants []PortGrant
+	for rows.Next() {
+		grant, err := scanPortGrant(rows)
+		if err != nil {
+			return nil, err
+		}
+		grants = append(grants, *grant)
+	}
+	return grants, rows.Err()
+}
+
+func (s *Store) RemotePortInUse(ctx context.Context, protocol string, remotePort int) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM lease_proxy_allocations a
+		JOIN runtime_leases l ON l.lease_id=a.lease_id
+		WHERE a.proxy_type=? AND a.remote_port=? AND l.status='active' AND l.expires_at>CURRENT_TIMESTAMP(3)
+	`, protocol, remotePort).Scan(&count)
+	return count > 0, err
+}
+
 func (s *Store) FindOrCreateClient(ctx context.Context, userID, tokenID int64, clientID string) (*Client, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, user_id, token_id, client_id, status, COALESCE(ban_reason,''), COALESCE(frpc_addr,''), last_seen_at
+		SELECT id, user_id, token_id, client_id, status, COALESCE(ban_reason,''), COALESCE(frpc_addr,''), frpc_running, last_seen_at
 		FROM clients WHERE token_id=? AND client_id=?
 	`, tokenID, clientID)
 	client, err := scanClient(row)
@@ -589,7 +618,7 @@ func (s *Store) FindOrCreateClient(ctx context.Context, userID, tokenID int64, c
 	}
 	id, _ := res.LastInsertId()
 	row = s.db.QueryRowContext(ctx, `
-		SELECT id, user_id, token_id, client_id, status, COALESCE(ban_reason,''), COALESCE(frpc_addr,''), last_seen_at
+		SELECT id, user_id, token_id, client_id, status, COALESCE(ban_reason,''), COALESCE(frpc_addr,''), frpc_running, last_seen_at
 		FROM clients WHERE id=?
 	`, id)
 	return scanClient(row)
@@ -606,7 +635,7 @@ func (s *Store) UpdateClientFRPCAddress(ctx context.Context, tokenID int64, clie
 
 func (s *Store) GetClientByID(ctx context.Context, id int64) (*Client, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, user_id, token_id, client_id, status, COALESCE(ban_reason,''), COALESCE(frpc_addr,''), last_seen_at
+		SELECT id, user_id, token_id, client_id, status, COALESCE(ban_reason,''), COALESCE(frpc_addr,''), frpc_running, last_seen_at
 		FROM clients WHERE id=?
 	`, id)
 	return scanClient(row)
@@ -614,7 +643,7 @@ func (s *Store) GetClientByID(ctx context.Context, id int64) (*Client, error) {
 
 func (s *Store) GetClient(ctx context.Context, tokenID int64, clientID string) (*Client, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, user_id, token_id, client_id, status, COALESCE(ban_reason,''), COALESCE(frpc_addr,''), last_seen_at
+		SELECT id, user_id, token_id, client_id, status, COALESCE(ban_reason,''), COALESCE(frpc_addr,''), frpc_running, last_seen_at
 		FROM clients WHERE token_id=? AND client_id=?
 	`, tokenID, clientID)
 	return scanClient(row)
@@ -623,7 +652,7 @@ func (s *Store) GetClient(ctx context.Context, tokenID int64, clientID string) (
 func (s *Store) ListClients(ctx context.Context) ([]Client, error) {
 	clients := []Client{}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, user_id, token_id, client_id, status, COALESCE(ban_reason,''), COALESCE(frpc_addr,''), last_seen_at
+		SELECT id, user_id, token_id, client_id, status, COALESCE(ban_reason,''), COALESCE(frpc_addr,''), frpc_running, last_seen_at
 		FROM clients ORDER BY id DESC
 	`)
 	if err != nil {
@@ -655,7 +684,7 @@ func (s *Store) DeleteClient(ctx context.Context, id int64) (*Client, error) {
 	defer tx.Rollback()
 
 	row := tx.QueryRowContext(ctx, `
-		SELECT id, user_id, token_id, client_id, status, COALESCE(ban_reason,''), COALESCE(frpc_addr,''), last_seen_at
+		SELECT id, user_id, token_id, client_id, status, COALESCE(ban_reason,''), COALESCE(frpc_addr,''), frpc_running, last_seen_at
 		FROM clients WHERE id=?
 	`, id)
 	client, err := scanClient(row)
@@ -832,7 +861,7 @@ func scanUserResourcePolicy(row scanner) (*UserResourcePolicy, error) {
 func scanClient(row scanner) (*Client, error) {
 	var client Client
 	var lastSeen sql.NullTime
-	err := row.Scan(&client.ID, &client.UserID, &client.TokenID, &client.ClientID, &client.Status, &client.BanReason, &client.FrpcAddr, &lastSeen)
+	err := row.Scan(&client.ID, &client.UserID, &client.TokenID, &client.ClientID, &client.Status, &client.BanReason, &client.FrpcAddr, &client.FRPCRunning, &lastSeen)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
