@@ -94,6 +94,7 @@ func (cm *ControlManager) Close() error {
 
 // SessionContext encapsulates the input parameters for creating a new Control.
 type SessionContext struct {
+	ProxyLifecycle *ProxyLifecycle
 	// all resource managers and controllers
 	RC *controller.ResourceController
 	// proxy manager
@@ -128,7 +129,8 @@ type Control struct {
 	msgDispatcher *msg.Dispatcher
 
 	// work connections
-	workConnCh chan *proxy.WorkConn
+	workConnCh     chan *proxy.WorkConn
+	workConnClosed bool // guarded by mu; excludes send/close races
 
 	// proxies in one client
 	proxies map[string]proxy.Proxy
@@ -200,12 +202,11 @@ func (ctl *Control) Replaced(newCtl *Control) {
 
 func (ctl *Control) RegisterWorkConn(conn *proxy.WorkConn) error {
 	xl := ctl.xl
-	defer func() {
-		if err := recover(); err != nil {
-			xl.Errorf("panic error: %v", err)
-			xl.Errorf(string(debug.Stack()))
-		}
-	}()
+	ctl.mu.RLock()
+	defer ctl.mu.RUnlock()
+	if ctl.workConnClosed {
+		return pkgerr.ErrCtlClosed
+	}
 
 	select {
 	case ctl.workConnCh <- conn:
@@ -296,6 +297,9 @@ func (ctl *Control) loginUserInfo() plugin.UserInfo {
 func (ctl *Control) closeProxy(pxy proxy.Proxy) {
 	pxy.Close()
 	ctl.sessionCtx.PxyManager.Del(pxy.GetName())
+	if hook := ctl.sessionCtx.ProxyLifecycle; hook != nil && hook.Closed != nil {
+		hook.Closed(ctl.loginUserInfo(), pxy.GetName())
+	}
 	metrics.Server.CloseProxy(pxy.GetName(), pxy.GetConfigurer().GetBaseConfig().Type)
 
 	notifyContent := &plugin.CloseProxyContent{
@@ -319,6 +323,7 @@ func (ctl *Control) worker() {
 	ctl.sessionCtx.Conn.Close()
 
 	ctl.mu.Lock()
+	ctl.workConnClosed = true
 	close(ctl.workConnCh)
 	for workConn := range ctl.workConnCh {
 		workConn.Close()
@@ -429,6 +434,14 @@ func (ctl *Control) handleCloseProxy(m msg.Message) {
 }
 
 func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (remoteAddr string, err error) {
+	if hook := ctl.sessionCtx.ProxyLifecycle; hook != nil && hook.Begin != nil {
+		var release func()
+		release, err = hook.Begin(ctl.loginUserInfo())
+		if err != nil {
+			return "", err
+		}
+		defer release()
+	}
 	var pxyConf v1.ProxyConfigurer
 	// Load configures from NewProxy message and validate.
 	pxyConf, err = config.NewProxyConfigurerFromMsg(pxyMsg, ctl.sessionCtx.ServerCfg)
@@ -502,6 +515,9 @@ func (ctl *Control) RegisterProxy(pxyMsg *msg.NewProxy) (remoteAddr string, err 
 
 	ctl.mu.Lock()
 	ctl.proxies[pxy.GetName()] = pxy
+	if hook := ctl.sessionCtx.ProxyLifecycle; hook != nil && hook.Opened != nil {
+		hook.Opened(ctl.loginUserInfo(), pxy.GetName())
+	}
 	ctl.mu.Unlock()
 	return
 }

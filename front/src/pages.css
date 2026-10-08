@@ -1,0 +1,34 @@
+/* Advanced settings are document pages, never nested scrollable dialogs. */
+.panel-route-page, .advanced-settings-page { min-width: 0; }
+.panel-route-page > .page-stack, .panel-route-page > .split-page,
+.advanced-settings-page { animation: blue-page-enter 240ms ease both; }
+.advanced-settings-page { display: grid; gap: 20px; width: 100%; }
+.advanced-page-head { display: flex; justify-content: space-between; align-items: center; gap: 20px; padding: 24px; }
+.advanced-page-head h3 { margin-top: 5px; }
+.advanced-page-form { display: grid; gap: 20px; min-width: 0; }
+.advanced-mode-panel { display: grid; gap: 16px; padding: 22px; }
+.advanced-category-nav { display: grid; grid-template-columns: repeat(auto-fit,minmax(150px,1fr)); gap: 10px; }
+.advanced-category-nav a { display: grid; align-content: start; gap: 8px; padding: 18px; border: 1px solid var(--line); border-radius: 13px; background: rgba(255,255,255,.62); color: #526b8d; text-decoration: none; transition: background-color 150ms ease, border-color 150ms ease; }
+.advanced-category-nav a:hover { border-color: #9cbfea; background: #e7f0ff; }
+.advanced-category-nav a.selected { border-color: #84afec; background: #dceaff; color: #245dad; }
+.advanced-category-nav small { color: var(--muted); line-height: 1.6; }
+.advanced-category-nav a:focus-visible, .nav-list a:focus-visible { outline: 3px solid #80aef0; outline-offset: 3px; }
+.advanced-save-bar { position: sticky; bottom: 16px; z-index: 3; padding: 18px 22px; box-shadow: 0 8px 30px rgba(25,67,130,.12); }
+.advanced-save-bar > p { flex: 1; }
+.advanced-status { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; line-height: 1.7; color: var(--muted); }
+.route-status { display: grid; justify-items: start; gap: 18px; padding: 32px; line-height: 1.7; }
+.route-status a { text-decoration: none; }
+@media (min-width: 961px) {
+  .sidebar { position: sticky; top: 0; height: 100dvh; min-height: 0; overflow-y: auto; }
+}
+@media (max-width: 760px) {
+  .advanced-page-head { flex-direction: column; align-items: stretch; padding: 18px; }
+  .advanced-category-nav { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .advanced-category-nav a { padding: 14px; }
+  .advanced-save-bar { position: static; }
+  .advanced-save-bar .actions { width: 100%; }
+  .advanced-save-bar .actions button { flex: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .panel-route-page > .page-stack, .panel-route-page > .split-page, .advanced-settings-page { animation: none; }
+}

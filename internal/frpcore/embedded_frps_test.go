@@ -45,3 +45,22 @@ func TestControlPluginAddrNormalizesWildcardBind(t *testing.T) {
 		t.Fatalf("unexpected plugin addr %q", got)
 	}
 }
+
+func TestAdvancedTransportDefaultsAndOverrides(t *testing.T) {
+	base := config.Config{FRPServerPort: 7000, HTTPAddr: ":8080"}
+	defaults, err := BuildEmbeddedFRPSConfig(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !*defaults.Transport.TCPMux || defaults.Transport.TCPKeepAlive != 7200 || defaults.Transport.MaxPoolCount != 5 || defaults.UserConnTimeout != 10 {
+		t.Fatal("existing FRP defaults changed")
+	}
+	base.ConnectionTuning = config.ConnectionTuning{DisableTCPMux: true, TCPMuxKeepaliveSeconds: 40, TCPKeepaliveSeconds: 300, MaxPoolCount: 20, HeartbeatTimeoutSeconds: 120, UserConnectionTimeoutSeconds: 30}
+	tuned, err := BuildEmbeddedFRPSConfig(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *tuned.Transport.TCPMux || tuned.Transport.TCPMuxKeepaliveInterval != 40 || tuned.Transport.TCPKeepAlive != 300 || tuned.Transport.MaxPoolCount != 20 || tuned.Transport.HeartbeatTimeout != 120 || tuned.UserConnTimeout != 30 {
+		t.Fatal("advanced overrides were not applied")
+	}
+}

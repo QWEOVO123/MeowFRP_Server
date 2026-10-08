@@ -3,8 +3,11 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"time"
+
+	"frp-control-server/internal/config"
 )
 
 type NodeCommandRecord struct {
@@ -74,7 +77,7 @@ func (s *Store) CreateNodeCommand(ctx context.Context, c NodeCommandRecord) erro
 	return err
 }
 func (s *Store) ListPendingNodeCommands(ctx context.Context, nodeID string) ([]NodeCommandRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT command_id,node_id,command_type,payload_json,status,COALESCE(result_json,''),expires_at,created_at,updated_at FROM node_commands WHERE node_id=? AND status IN('pending','delivered') AND expires_at>CURRENT_TIMESTAMP(3) ORDER BY created_at LIMIT 100`, nodeID)
+	rows, err := s.db.QueryContext(ctx, `SELECT command_id,node_id,command_type,payload_json,status,COALESCE(result_json,''),expires_at,created_at,updated_at FROM node_commands WHERE node_id=? AND status IN('pending','delivered') AND (expires_at>CURRENT_TIMESTAMP(3) OR command_type IN ('update_edge_runtime_settings','update_edge_permissions','update_edge_advanced_settings')) ORDER BY created_at,command_id LIMIT 100`, nodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -94,18 +97,95 @@ func (s *Store) MarkNodeCommandDelivered(ctx context.Context, id string) error {
 	return err
 }
 func (s *Store) CompleteNodeCommand(ctx context.Context, nodeID, id, status, result string) error {
-	if status != "succeeded" && status != "failed" {
+	if status != "succeeded" && status != "failed" && status != "retry" {
 		status = "failed"
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE node_commands SET status=?,result_json=? WHERE node_id=? AND command_id=?`, status, result, nodeID, id)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return ErrNotFound
+	defer tx.Rollback()
+	var kind, payload, previous string
+	// Serialize catalog updates for the node, including results from a replaced
+	// stream, so an older ACK cannot roll the directory back.
+	var registered string
+	if err := tx.QueryRowContext(ctx, `SELECT node_id FROM edge_nodes WHERE node_id=? FOR UPDATE`, nodeID).Scan(&registered); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
 	}
-	return nil
+	if err := tx.QueryRowContext(ctx, `SELECT command_type,payload_json,status FROM node_commands WHERE node_id=? AND command_id=? FOR UPDATE`, nodeID, id).Scan(&kind, &payload, &previous); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	// Duplicate results after reconnect must not roll the directory back.
+	if previous == "succeeded" || previous == "failed" {
+		return tx.Commit()
+	}
+	if status == "retry" {
+		status = "pending"
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE node_commands SET status=?,result_json=? WHERE node_id=? AND command_id=?`, status, result, nodeID, id); err != nil {
+		return err
+	}
+	if kind == "update_edge_runtime_settings" && status == "succeeded" {
+		var metadata struct {
+			Revision int64 `json:"_configuration_revision"`
+		}
+		_ = json.Unmarshal([]byte(payload), &metadata)
+		var greatest int64
+		greatest, err = greatestCompletedConfigurationRevision(ctx, tx, nodeID)
+		if err != nil {
+			return err
+		}
+		var envelope struct {
+			Result struct {
+				Superseded bool `json:"superseded"`
+			} `json:"result"`
+		}
+		_ = json.Unmarshal([]byte(result), &envelope)
+		if envelope.Result.Superseded || metadata.Revision < greatest {
+			return tx.Commit()
+		}
+		var node config.NodeRuntimeConfig
+		if err := json.Unmarshal([]byte(payload), &node); err != nil {
+			return err
+		}
+		// Commit the Controller-issued catalog fields only after this node has
+		// acknowledged writing the same settings. Offline/rejected saves do not
+		// make a node falsely selectable or change its client API endpoint.
+		if _, err := tx.ExecContext(ctx, `UPDATE edge_nodes SET name=?,public_api_url=?,selectable=? WHERE node_id=? AND status='active'`, node.Tag, node.PublicAPIURL, node.Selectable, nodeID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// Parse historical payloads independently so one malformed JSON row cannot
+// poison every later catalog update (including on MySQL 5.7).
+func greatestCompletedConfigurationRevision(ctx context.Context, tx *sql.Tx, nodeID string) (int64, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT payload_json FROM node_commands WHERE node_id=? AND command_type='update_edge_runtime_settings' AND status='succeeded'`, nodeID)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var greatest int64
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			return 0, err
+		}
+		var metadata struct {
+			Revision int64 `json:"_configuration_revision"`
+		}
+		if json.Unmarshal([]byte(payload), &metadata) == nil && metadata.Revision > greatest {
+			greatest = metadata.Revision
+		}
+	}
+	return greatest, rows.Err()
 }
 func (s *Store) RecordNodeEvent(ctx context.Context, nodeID string, sequence int64, eventID, eventType, payload string) (bool, error) {
 	result, err := s.db.ExecContext(ctx, `INSERT IGNORE INTO node_events(node_id,sequence,event_type,event_id,payload_json) VALUES(?,?,?,?,?)`, nodeID, sequence, eventType, eventID, payload)
@@ -134,14 +214,10 @@ func (s *Store) ReplaceEdgeClientPresence(ctx context.Context, nodeID string, cl
 			return err
 		}
 	}
-	_, err = tx.ExecContext(ctx, `DELETE FROM edge_client_presence WHERE last_seen_at<DATE_SUB(CURRENT_TIMESTAMP(3),INTERVAL 90 SECOND)`)
-	if err != nil {
-		return err
-	}
 	return tx.Commit()
 }
 func (s *Store) ListEdgeClientPresence(ctx context.Context, nodeID string) ([]EdgeClientPresence, error) {
-	query := `SELECT node_id,user_id,token_id,client_id,frpc_running,last_seen_at FROM edge_client_presence WHERE last_seen_at>=DATE_SUB(CURRENT_TIMESTAMP(3),INTERVAL 90 SECOND)`
+	query := `SELECT node_id,user_id,token_id,client_id,frpc_running,last_seen_at FROM edge_client_presence WHERE 1=1`
 	args := []any{}
 	if nodeID != "" {
 		query += ` AND node_id=?`
@@ -183,7 +259,7 @@ func (s *Store) ReplaceEdgeConnectionPresence(ctx context.Context, nodeID string
 }
 
 func (s *Store) ListEdgeConnectionPresence(ctx context.Context, nodeID string) ([]EdgeConnectionPresence, error) {
-	query := `SELECT node_id,connection_id,protocol,user_id,token_id,client_id,client_addr,lease_id,proxy_name,proxy_type,remote_port,inbound_addr,inbound_ip,inbound_port,server_addr,opened_at,last_seen_at,can_terminate FROM edge_connection_presence WHERE updated_at>=DATE_SUB(CURRENT_TIMESTAMP(3),INTERVAL 90 SECOND)`
+	query := `SELECT node_id,connection_id,protocol,user_id,token_id,client_id,client_addr,lease_id,proxy_name,proxy_type,remote_port,inbound_addr,inbound_ip,inbound_port,server_addr,opened_at,last_seen_at,can_terminate FROM edge_connection_presence WHERE 1=1`
 	args := []any{}
 	if nodeID != "" {
 		query += ` AND node_id=?`

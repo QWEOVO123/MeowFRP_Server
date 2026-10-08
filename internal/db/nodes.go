@@ -22,40 +22,50 @@ type EdgeNode struct {
 }
 
 func (s *Store) CreateEnrollmentToken(ctx context.Context, tokenValue, tokenPrefix string, maxUses int, expiresAt time.Time, createdBy int64) error {
+	return s.CreateEnrollmentTokenWithSettings(ctx, tokenValue, tokenPrefix, maxUses, expiresAt, createdBy, "")
+}
+
+func (s *Store) CreateEnrollmentTokenWithSettings(ctx context.Context, tokenValue, tokenPrefix string, maxUses int, expiresAt time.Time, createdBy int64, settings string) error {
 	if maxUses <= 0 {
 		maxUses = 1
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO node_enrollment_tokens(token_hash,plain_token,token_prefix,max_uses,expires_at,created_by) VALUES(SHA2(?,256),?,?,?,?,?)`, tokenValue, tokenValue, tokenPrefix, maxUses, expiresAt, createdBy)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO node_enrollment_tokens(token_hash,plain_token,token_prefix,max_uses,expires_at,created_by,settings_json) VALUES(SHA2(?,256),?,?,?,?,?,?)`, tokenValue, tokenValue, tokenPrefix, maxUses, expiresAt, createdBy, settings)
 	return err
 }
 
 func (s *Store) ConsumeEnrollmentToken(ctx context.Context, tokenValue string) error {
+	_, err := s.ConsumeEnrollmentTokenSettings(ctx, tokenValue)
+	return err
+}
+
+func (s *Store) ConsumeEnrollmentTokenSettings(ctx context.Context, tokenValue string) (string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer tx.Rollback()
 	var status string
 	var maxUses, useCount int
 	var expiresAt time.Time
-	err = tx.QueryRowContext(ctx, `SELECT status,max_uses,use_count,expires_at FROM node_enrollment_tokens WHERE plain_token=? OR token_hash=? OR token_hash=SHA2(?,256) FOR UPDATE`, tokenValue, tokenValue, tokenValue).Scan(&status, &maxUses, &useCount, &expiresAt)
+	var settings sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT status,max_uses,use_count,expires_at,settings_json FROM node_enrollment_tokens WHERE plain_token=? OR token_hash=? OR token_hash=SHA2(?,256) FOR UPDATE`, tokenValue, tokenValue, tokenValue).Scan(&status, &maxUses, &useCount, &expiresAt, &settings)
 	if errors.Is(err, sql.ErrNoRows) {
-		return ErrNotFound
+		return "", ErrNotFound
 	}
 	if err != nil {
-		return err
+		return "", err
 	}
 	if status != "active" || useCount >= maxUses || time.Now().After(expiresAt) {
-		return errors.New("enrollment token is expired or already used")
+		return "", errors.New("enrollment token is expired or already used")
 	}
 	newStatus := "active"
 	if useCount+1 >= maxUses {
 		newStatus = "used"
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE node_enrollment_tokens SET use_count=use_count+1,status=?,used_at=CURRENT_TIMESTAMP(3) WHERE plain_token=? OR token_hash=? OR token_hash=SHA2(?,256)`, newStatus, tokenValue, tokenValue, tokenValue); err != nil {
-		return err
+		return "", err
 	}
-	return tx.Commit()
+	return settings.String, tx.Commit()
 }
 
 func (s *Store) UpsertEdgeNode(ctx context.Context, node EdgeNode) error {
@@ -133,4 +143,36 @@ func (s *Store) ListPublicEdgeNodes(ctx context.Context) ([]EdgeNode, error) {
 		result = append(result, node)
 	}
 	return result, rows.Err()
+}
+
+// DeleteEdgeNode removes the registration and user grants atomically. Foreign
+// keys remove the node's telemetry, presence and pending commands.
+func (s *Store) DeleteEdgeNode(ctx context.Context, nodeID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var existing string
+	if err = tx.QueryRowContext(ctx, `SELECT node_id FROM edge_nodes WHERE node_id=? FOR UPDATE`, nodeID).Scan(&existing); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM user_node_access WHERE node_id=?`, nodeID); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM dpi_events WHERE node_id=?`, nodeID); err != nil {
+		return err
+	}
+	for _, table := range []string{"user_node_cache", "node_cache_sessions"} {
+		if _, err = tx.ExecContext(ctx, "DELETE FROM "+table+" WHERE node_id=?", nodeID); err != nil {
+			return err
+		}
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM edge_nodes WHERE node_id=?`, nodeID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

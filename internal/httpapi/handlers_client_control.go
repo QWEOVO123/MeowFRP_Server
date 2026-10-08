@@ -83,6 +83,9 @@ func (s *Server) clientHeartbeat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "access_token and client_id are required")
 		return
 	}
+	if s.faultHeartbeat(w, r, req) {
+		return
+	}
 	_, _, client, reject := s.validateAccessTokenRequest(r, store, req.AccessToken, req.ClientID)
 	if reject != nil {
 		writeJSON(w, http.StatusOK, reject)

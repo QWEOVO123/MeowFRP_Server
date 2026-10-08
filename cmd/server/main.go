@@ -66,11 +66,13 @@ func main() {
 			setupHost = *apiBind
 		}
 		cfg.HTTPAddr = fmt.Sprintf("%s:%d", setupHost, setupPort)
-		cfg.EmbeddedFRPEnabled = false
+		// Setup mode gates listener startup below. Do not change the persisted
+		// preference: setup handlers save this Config after initialization.
 		if cfg.ConfigError != "" {
 			log.Printf("configuration is invalid; entering local setup mode: %s", cfg.ConfigError)
 		}
 	}
+	log.Printf("startup config: path=%s state=%s mode=%s configuration_mode=%s embedded_frps_enabled=%t edge_access_enabled=%t", cfg.ConfigPath, cfg.ConfigState, cfg.Mode, cfg.ConfigurationMode, cfg.EmbeddedFRPEnabled, cfg.Controller.EdgeAccessEnabled)
 
 	var store *db.Store
 	if cfg.Mode == config.ModeController && cfg.MySQLDSN != "" {
@@ -96,6 +98,12 @@ func main() {
 			log.Fatalf("open edge state: %v", err)
 		}
 		defer edgeState.Close()
+		resetCtx, resetCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		err = edgeState.ResetIdentityCache(resetCtx)
+		resetCancel()
+		if err != nil {
+			log.Fatalf("reset edge identity cache at boot: %v", err)
+		}
 		edgeTLS := cluster.TLSFiles{CAFile: config.ResolvePath(cfg.ConfigPath, cfg.Edge.TLS.CAFile), CertFile: config.ResolvePath(cfg.ConfigPath, cfg.Edge.TLS.CertFile), KeyFile: config.ResolvePath(cfg.ConfigPath, cfg.Edge.TLS.KeyFile)}
 		if cfg.Edge.TLS.CACertificateBase64 != "" {
 			edgeTLS.CAPEM, err = config.DecodePEM(cfg.Edge.TLS.CACertificateBase64)
@@ -113,6 +121,8 @@ func main() {
 		}
 		edgeClient = cluster.NewEdgeClient(cfg.Edge.ControllerAddr, cfg.Edge.NodeID, cfg.Edge.ServerName, edgeTLS, map[string]any{"reporting": cfg.Edge.Reporting, "remote_commands": cfg.Edge.RemoteCommands, "controller_administration_enabled": cfg.Edge.ControllerAdministrationEnabled, "admin_username": cfg.InitialAdmin.Username, "admin_display_name": cfg.InitialAdmin.DisplayName, "runtime_settings": cfg.Node})
 		edgeClient.SetSnapshotHandler(edgeState.ApplyIdentitySnapshot)
+		edgeClient.SetCacheResetHandler(edgeState.DiscardControlIdentityCache)
+		edgeClient.EnableSessionResumption(cfg.ConnectionTuning.EnableMTLSSessionResumption)
 	}
 	var dpiEventSink dpi.EventSink
 	if store != nil {
@@ -148,12 +158,13 @@ func main() {
 	}
 	dpihook.Register(frpCore)
 	var controllerControl *cluster.ControllerServer
-	if cfg.Mode == config.ModeController && cfg.Controller.EdgeAccessEnabled && store != nil {
+	if cfg.ConfigState == "configured" && cfg.Mode == config.ModeController && cfg.Controller.EdgeAccessEnabled && store != nil {
 		controllerControl, err = buildControllerControl(cfg, store)
 		if err != nil {
 			log.Fatalf("controller PKI: %v", err)
 		}
 		controllerControl.SetHeartbeatInterval(cfg.Controller.HeartbeatIntervalSeconds)
+		controllerControl.ConfigureTransport(time.Duration(cfg.ConnectionTuning.MTLSHandshakeTimeoutSeconds)*time.Second, cfg.ConnectionTuning.DisableMTLSSessionTickets)
 	}
 	api := httpapi.NewServer(cfg, store, httpapi.WithDPIService(dpiService), httpapi.WithFRPCore(frpCore), httpapi.WithEdgeRuntime(edgeState, edgeClient), httpapi.WithControllerControl(controllerControl))
 	if edgeState != nil {
@@ -161,8 +172,48 @@ func main() {
 	}
 	if edgeClient != nil {
 		edgeClient.SetSnapshotHandler(func(ctx context.Context, payload json.RawMessage) error {
+			var snapshot cluster.IdentitySnapshot
+			if err := json.Unmarshal(payload, &snapshot); err != nil {
+				return err
+			}
 			if err := edgeState.ApplyIdentitySnapshot(ctx, payload); err != nil {
 				return err
+			}
+			// Never revoke all runtime leases because a later baseline page has
+			// not arrived yet. Finalization performs a complete permission check.
+			if snapshot.Baseline && !snapshot.BaselineEnd {
+				return nil
+			}
+			affected := map[int64]bool{}
+			for _, user := range snapshot.Users {
+				affected[user.ID] = true
+			}
+			for _, id := range snapshot.RemovedUserIDs {
+				affected[id] = true
+			}
+			checkedLeases := map[string]bool{}
+			lastProgress := time.Now()
+			for _, connection := range frpCore.ListConnections(cfg.UDPConnectionTTL) {
+				if frpCore.ClientDraining(connection.TokenID, connection.ClientID) {
+					continue
+				}
+				if snapshot.Incremental && !affected[connection.UserID] {
+					continue
+				}
+				if checkedLeases[connection.LeaseID] {
+					continue
+				}
+				checkedLeases[connection.LeaseID] = true
+				if err := edgeState.RuntimeConnectionAuthorized(ctx, connection.UserID, connection.TokenID, connection.LeaseID); err != nil {
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					frpCore.TerminateConnectionsForLease(connection.LeaseID)
+				}
+				if len(checkedLeases)%64 == 0 || time.Since(lastProgress) >= time.Second {
+					cluster.ReportIdentityProgress(ctx, int64(len(checkedLeases)))
+					lastProgress = time.Now()
+				}
 			}
 			blocks, err := edgeState.ListBlockedIPs(ctx)
 			if err != nil {
@@ -171,7 +222,7 @@ func main() {
 			wanted := map[string]bool{}
 			for _, block := range blocks {
 				wanted[block.IP] = true
-				frpCore.SetBlockedInboundIP(frpcore.BlockedInboundIP{IP: block.IP, Reason: block.Reason, CreatedAt: block.CreatedAt})
+				frpCore.EnforceBlockedInboundIP(frpcore.BlockedInboundIP{IP: block.IP, Reason: block.Reason, CreatedAt: block.CreatedAt})
 			}
 			for _, block := range frpCore.ListBlockedInboundIPs() {
 				if !wanted[block.IP] {
@@ -220,8 +271,12 @@ func main() {
 			log.Fatalf("embedded frps: %v", err)
 		}
 	}
-	if cfg.EmbeddedFRPEnabled {
+	if cfg.ConfigState != "configured" {
+		log.Printf("embedded frps not started: initialization or configuration repair requires a restart")
+	} else if cfg.EmbeddedFRPEnabled {
 		log.Printf("embedded frps listening on %s:%d", cfg.FRPBindAddr, cfg.FRPServerPort)
+	} else {
+		log.Printf("embedded frps disabled by configuration; no FRP control port will be opened by this process")
 	}
 
 	quit := make(chan os.Signal, 1)

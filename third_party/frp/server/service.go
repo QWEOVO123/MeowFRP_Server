@@ -76,6 +76,8 @@ func init() {
 
 // Server service
 type Service struct {
+	// Installed before Run; hooks must not perform database/network I/O.
+	ProxyLifecycle *ProxyLifecycle
 	// Dispatch connections to different handlers listen on same port
 	muxer *mux.Mux
 
@@ -437,7 +439,7 @@ func (svr *Service) handleConnection(ctx context.Context, conn net.Conn, interna
 
 	acceptedConn, err := svr.acceptConnection(ctx, conn)
 	if err != nil {
-		log.Tracef("failed to accept frp connection: %v", err)
+		log.Warnf("failed to accept frp connection from %s: %v", conn.RemoteAddr(), err)
 		conn.Close()
 		return
 	}
@@ -768,6 +770,7 @@ func (svr *Service) RegisterControl(
 	}
 
 	ctl, err := NewControl(ctx, &SessionContext{
+		ProxyLifecycle: svr.ProxyLifecycle,
 		RC:             svr.rc,
 		PxyManager:     svr.pxyManager,
 		PluginManager:  svr.pluginManager,

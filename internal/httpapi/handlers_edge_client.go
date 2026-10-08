@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,14 +11,18 @@ import (
 
 	"frp-control-server/internal/db"
 	"frp-control-server/internal/edgestate"
+	"frp-control-server/internal/frpcore"
 	"frp-control-server/internal/security"
 )
 
 func (s *Server) edgeOnlineForNewSessions() bool {
-	return s.edgeState != nil && s.edgeClient != nil && s.edgeClient.Connected() && s.edgeClient.SyncReady()
+	s.fault.mu.Lock()
+	failed := s.fault.closed || s.fault.localFailed
+	s.fault.mu.Unlock()
+	return !failed && s.edgeState != nil && s.edgeClient != nil && s.edgeClient.Connected() && s.edgeClient.SyncReady() && !s.edgeClient.ControllerFault()
 }
 func edgeDisconnected(w http.ResponseWriter) {
-	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "status": "edge_controller_disconnected", "error": "edge_controller_disconnected", "reason": "边缘节点与中心节点失联"})
+	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "status": "edge_controller_disconnected", "error": "edge_controller_disconnected", "reason": "边缘控制通道不可用或用户信息正在同步，请稍后重试"})
 }
 
 func (s *Server) edgeCredential(r *http.Request, plain, clientID string, create bool) (*db.AccessToken, *db.User, *db.Client, map[string]any) {
@@ -26,11 +31,19 @@ func (s *Server) edgeCredential(r *http.Request, plain, clientID string, create 
 	}
 	t, u, c, err := s.edgeState.Credential(r.Context(), security.TokenHash(plain), strings.TrimSpace(clientID), create)
 	if err != nil {
+		if !errors.Is(err, db.ErrNotFound) && !errors.Is(err, sql.ErrNoRows) {
+			s.transitionNodeFault(true)
+			return nil, nil, nil, map[string]any{"ok": false, "status": "database_unavailable", "reason": "节点异常：本地 data 数据库暂时不可用"}
+		}
 		return nil, nil, nil, map[string]any{"ok": false, "status": "unauthorized", "reason": "invalid access token"}
 	}
 	if err := edgestate.ValidateCredential(t, u, c); err != nil {
 		return nil, nil, nil, map[string]any{"ok": false, "status": "rejected", "reason": err.Error()}
 	}
+	if s.clientIsDraining(c.TokenID, c.ClientID) && strings.HasSuffix(r.URL.Path, "/bootstrap") {
+		return nil, nil, nil, map[string]any{"ok": false, "status": "node_fault", "reason": "节点异常：请关闭全部穿透端口后重新登录"}
+	}
+	s.rememberClient(plain, c, strings.HasSuffix(r.URL.Path, "/resource-policy"))
 	return t, u, c, nil
 }
 
@@ -51,7 +64,7 @@ func (s *Server) edgeClientResourcePolicy(w http.ResponseWriter, r *http.Request
 	}
 	p, err := s.edgeState.Policy(r.Context(), u.ID)
 	if err != nil || !p.Enabled {
-		writeJSON(w, 200, map[string]any{"ok": false, "status": "rejected", "reason": "resource policy is not configured"})
+		writeJSON(w, 200, map[string]any{"ok": false, "status": "rejected", "reason": "资源策略未同步或已禁用，请检查中心用户资源策略；刚保存后请稍候重新选择节点"})
 		return
 	}
 	_ = s.edgeState.TouchClientSeen(r.Context(), c.ID)
@@ -61,7 +74,12 @@ func (s *Server) edgeClientResourcePolicy(w http.ResponseWriter, r *http.Request
 		writeJSON(w, 200, map[string]any{"ok": false, "status": "rejected", "reason": "node and user port ranges do not overlap"})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "user": u.Username, "token": t.Name, "policy": p, "dpi": clientDPISummary{Enabled: false, Mode: "monitor", EnabledDetectors: []string{}, BlockedTrafficTypes: []string{}, AllowedTrafficTypes: []string{}}, "frp_server_addr": cfg.FRPServerAddr, "frp_server_port": cfg.FRPServerPort, "frp_transport_tls": cfg.FRPTransportTLS})
+	dpiPolicy, err := s.edgeState.DPIPolicy(r.Context(), u.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "read cached DPI policy failed")
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "user": u.Username, "token": t.Name, "policy": p, "dpi": clientDPISummaryFromPolicy(dpiPolicy), "frp_server_addr": cfg.FRPServerAddr, "frp_server_port": cfg.FRPServerPort, "frp_transport_tls": cfg.FRPTransportTLS})
 }
 
 func (s *Server) edgeClientBootstrap(w http.ResponseWriter, r *http.Request) {
@@ -83,7 +101,7 @@ func (s *Server) edgeClientBootstrap(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": false, "status": "heartbeat_timeout", "reason": "client heartbeat timeout, please reconnect"})
 		return
 	}
-	allocations, err := s.validateEdgeProxies(r, t, u, req.Proxies)
+	allocations, err := s.validateEdgeProxies(r, t, u, req.Proxies, req.ClientID)
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"ok": false, "status": "rejected", "reason": err.Error()})
 		return
@@ -107,13 +125,17 @@ func (s *Server) edgeClientBootstrap(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"ok": true, "lease_id": leaseID, "expires_at": expires, "expires_in": int(s.getConfig().RuntimeTokenTTL.Seconds()), "frpc_config": s.renderFrpcConfig(u, leaseID, runtimeToken, allocations), "allocations": allocations})
 }
 
-func (s *Server) validateEdgeProxies(r *http.Request, t *db.AccessToken, u *db.User, input []db.ProxyAllocationInput) ([]db.ProxyAllocationInput, error) {
+func (s *Server) validateEdgeProxies(r *http.Request, t *db.AccessToken, u *db.User, input []db.ProxyAllocationInput, clientIDs ...string) ([]db.ProxyAllocationInput, error) {
+	clientID := ""
+	if len(clientIDs) > 0 {
+		clientID = clientIDs[0]
+	}
 	if len(input) == 0 {
 		return nil, fmt.Errorf("at least one proxy is required")
 	}
 	p, err := s.edgeState.Policy(r.Context(), u.ID)
 	if err != nil || !p.Enabled {
-		return nil, fmt.Errorf("resource policy is not configured")
+		return nil, fmt.Errorf("资源策略未同步或已禁用，请检查中心用户资源策略；刚保存后请稍候重新选择节点")
 	}
 	if p.MaxPorts > 0 && len(input) > p.MaxPorts {
 		return nil, fmt.Errorf("proxy count exceeds user limit")
@@ -126,18 +148,31 @@ func (s *Server) validateEdgeProxies(r *http.Request, t *db.AccessToken, u *db.U
 	if !rangeAvailable {
 		return nil, fmt.Errorf("node and user port ranges do not overlap")
 	}
-	grants, _ := s.edgeState.Grants(r.Context(), t.ID)
+	grants, err := s.edgeState.Grants(r.Context(), t.ID)
+	if err != nil {
+		return nil, fmt.Errorf("read token grants: %w", err)
+	}
 	requestedPorts := map[string]bool{}
+	requestedNames := map[string]bool{}
 	for i := range input {
 		v := &input[i]
 		v.ProxyName = strings.TrimSpace(v.ProxyName)
 		v.ProxyType = normalizeProtocol(v.ProxyType)
 		v.LocalIP = strings.TrimSpace(v.LocalIP)
+		v.Domain = strings.TrimSpace(v.Domain)
+		v.Subdomain = strings.TrimSpace(v.Subdomain)
 		if v.LocalIP == "" {
 			v.LocalIP = "127.0.0.1"
 		}
-		if v.ProxyName == "" || v.LocalPort <= 0 || (v.ProxyType != "tcp" && v.ProxyType != "udp") {
+		if v.ProxyName == "" || v.LocalPort <= 0 || v.LocalPort > 65535 || (v.ProxyType != "tcp" && v.ProxyType != "udp") {
 			return nil, fmt.Errorf("invalid proxy")
+		}
+		if requestedNames[v.ProxyName] {
+			return nil, fmt.Errorf("proxy name %s is duplicated", v.ProxyName)
+		}
+		requestedNames[v.ProxyName] = true
+		if len(v.ProxyName) > 48 {
+			return nil, fmt.Errorf("proxy name must not exceed 48 bytes")
 		}
 		if !protocolAllowed(v.ProxyType, p.AllowedProtocols) || v.RemotePort < p.PortStart || v.RemotePort > p.PortEnd {
 			return nil, fmt.Errorf("proxy %s is outside policy", v.ProxyName)
@@ -150,7 +185,7 @@ func (s *Server) validateEdgeProxies(r *http.Request, t *db.AccessToken, u *db.U
 			return nil, fmt.Errorf("remote port %d is duplicated in this request", v.RemotePort)
 		}
 		requestedPorts[portKey] = true
-		if used, err := s.edgeState.RemotePortInUse(r.Context(), v.ProxyType, v.RemotePort); err != nil {
+		if used, err := s.edgeState.RemotePortInUseExceptClient(r.Context(), v.ProxyType, v.RemotePort, t.ID, clientID); err != nil {
 			return nil, err
 		} else if used {
 			return nil, fmt.Errorf("remote port %d is already in use on this node", v.RemotePort)
@@ -168,12 +203,26 @@ func (s *Server) edgeClientHeartbeat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err.Error())
 		return
 	}
+	if s.faultHeartbeat(w, r, req) {
+		return
+	}
+	if !s.edgeOnlineForNewSessions() {
+		nodeFaultResponse(w)
+		return
+	}
 	_, _, c, reject := s.edgeCredential(r, req.AccessToken, req.ClientID, true)
 	if reject != nil {
+		if s.edgeState.IdentityResetPending() {
+			edgeDisconnected(w)
+			return
+		}
 		writeJSON(w, 200, reject)
 		return
 	}
-	_ = s.edgeState.TouchClient(r.Context(), c.ID, req.FRPCRunning)
+	if err := s.edgeState.TouchClient(r.Context(), c.ID, req.FRPCRunning); err != nil {
+		writeError(w, 500, "save client heartbeat failed")
+		return
+	}
 	commands := []map[string]any{}
 	if queued, err := s.edgeState.PopClientCommands(r.Context(), c.ID); err == nil {
 		commands = append(commands, queued...)
@@ -184,7 +233,7 @@ func (s *Server) edgeClientHeartbeat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if show, _ := s.edgeState.DisconnectWarning(r.Context(), c.ID); show {
-			commands = append(commands, map[string]any{"id": -1, "command": "show_warning", "message": "边缘节点与中心节点失联；已建立的 FRP 将继续运行，但暂时不能新建连接。"})
+			commands = append(commands, map[string]any{"id": -1, "command": "show_warning", "message": "边缘节点与中心节点失联或正在同步；暂时无法新建连接，部分业务连接可能需要等待同步后重连。"})
 		}
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "status": "ok", "commands": commands, "heartbeat_interval": int(clientHeartbeatInterval.Seconds())})
@@ -228,7 +277,10 @@ func (s *Server) edgeClientLogout(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, reject)
 		return
 	}
-	_ = s.edgeState.RevokeClient(r.Context(), t.ID, req.ClientID)
+	if err := s.edgeState.RevokeClient(r.Context(), t.ID, req.ClientID); err != nil {
+		writeError(w, 500, "revoke client runtime failed")
+		return
+	}
 	deletedCommands, _ := s.edgeState.DeleteUnacknowledgedClientCommands(r.Context(), c.ID)
 	_ = s.edgeState.ClearClient(r.Context(), c.ID)
 	terminated := 0
@@ -248,6 +300,9 @@ func (s *Server) edgeFrpPlugin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, frpReject("bad plugin request"))
 		return
 	}
+	if s.faultFRPPlugin(w, req) {
+		return
+	}
 	switch req.Op {
 	case "Login":
 		var c frpLoginContent
@@ -255,11 +310,12 @@ func (s *Server) edgeFrpPlugin(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 200, frpReject("bad Login content"))
 			return
 		}
-		_, reason := s.edgeRuntime(r, c.Metas)
+		lease, reason := s.edgeRuntime(r, c.Metas)
 		if reason != "" {
 			writeJSON(w, 200, frpReject(reason))
 			return
 		}
+		s.rememberRuntime(r, lease)
 		writeJSON(w, 200, frpAllow())
 	case "NewProxy":
 		var c frpNewProxyContent
@@ -272,11 +328,16 @@ func (s *Server) edgeFrpPlugin(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 200, frpReject(reason))
 			return
 		}
-		name := stripFRPUserProxyPrefix(l.UserID, c.ProxyName)
+		name := stripFRPUserProxyPrefix(l.UserID, c.ProxyName, l.LeaseID)
+		if s.clientIsDraining(l.TokenID, l.ClientID) {
+			writeJSON(w, 200, frpReject("节点异常：禁止开启新穿透端口"))
+			return
+		}
 		if !s.edgeState.AllocationExists(r.Context(), l.LeaseID, name, normalizeProtocol(c.ProxyType), c.RemotePort, first(c.CustomDomains), strings.TrimSpace(c.Subdomain)) {
 			writeJSON(w, 200, frpReject("proxy is not allocated by current lease"))
 			return
 		}
+		s.core.BindProxy(frpcore.ProxyBinding{UserID: l.UserID, TokenID: l.TokenID, ClientID: l.ClientID, LeaseID: l.LeaseID, ProxyName: c.ProxyName, ProxyType: c.ProxyType, RemotePort: c.RemotePort})
 		writeJSON(w, 200, frpAllow())
 	case "Ping", "NewWorkConn", "NewUserConn":
 		var metas map[string]string

@@ -33,7 +33,15 @@ func initializeNodeRuntimeFromRequest(cfg *config.Config, r *http.Request, tag s
 		cfg.Node.PublicAPIURL = externalRequestBaseURL(r)
 	}
 	if isLocalAdvertiseAddress(cfg.Node.FRPAdvertiseAddr) || cfg.Node.FRPAdvertiseAddr == "" {
-		cfg.Node.FRPAdvertiseAddr = requestPublicHost(r)
+		if cfg.Mode == config.ModeController {
+			// Center setup obtains its address from server-side IPv4 discovery
+			// or explicit input, never the browser/CDN/reverse-proxy hostname.
+			if cfg.Node.FRPAdvertiseAddr == "" {
+				cfg.Node.FRPAdvertiseAddr = "127.0.0.1"
+			}
+		} else {
+			cfg.Node.FRPAdvertiseAddr = requestPublicHost(r)
+		}
 	}
 	syncLegacyFRPFields(cfg)
 }
@@ -52,14 +60,57 @@ func validateNodeRuntime(node config.NodeRuntimeConfig) error {
 	if node.FRPAdvertiseAddr == "" {
 		return fmt.Errorf("frp advertise address is required")
 	}
+	if err := validateFRPAdvertiseAddress(node.FRPAdvertiseAddr); err != nil {
+		return err
+	}
 	if err := config.ValidateNodeRuntime(node); err != nil {
 		return err
 	}
-	u, err := url.Parse(node.PublicAPIURL)
+	return validatePublicAPIURL(node.PublicAPIURL)
+}
+
+func validateFRPAdvertiseAddress(value string) error {
+	if net.ParseIP(strings.Trim(value, "[]")) != nil {
+		return nil
+	}
+	// Address and control port are separate fields; do not accept a URL,
+	// scheme, path, credentials or host:port as the FRP host.
+	if value == "" || len(value) > 253 || strings.ContainsAny(value, ":/\\?#@[] \t\r\n") {
+		return fmt.Errorf("FRP address must be an IP address or hostname without a scheme, port or path")
+	}
+	for _, label := range strings.Split(strings.TrimSuffix(value, "."), ".") {
+		if label == "" || len(label) > 63 || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return fmt.Errorf("invalid FRP hostname")
+		}
+		for _, ch := range label {
+			if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '-') {
+				return fmt.Errorf("invalid FRP hostname")
+			}
+		}
+	}
+	return nil
+}
+
+func validatePublicAPIURL(value string) error {
+	u, err := url.Parse(value)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return fmt.Errorf("public_api_url must be an absolute HTTP(S) URL")
 	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("public_api_url must not contain credentials, a query, or a fragment")
+	}
+	if u.Scheme == "http" && !isLoopbackAPIHost(u.Hostname()) {
+		return fmt.Errorf("public_api_url must use HTTPS for non-loopback hosts")
+	}
 	return nil
+}
+
+func isLoopbackAPIHost(host string) bool {
+	if strings.EqualFold(strings.TrimSpace(host), "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.TrimSpace(host))
+	return ip != nil && ip.IsLoopback()
 }
 
 func syncLegacyFRPFields(cfg *config.Config) {

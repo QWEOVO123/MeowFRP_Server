@@ -44,8 +44,8 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "unsupported role")
 		return
 	}
-	if req.Role == "admin" && len(req.Password) < 8 {
-		writeError(w, http.StatusBadRequest, "admin password must be at least 8 characters")
+	if req.Role == "admin" && (len(req.Password) < 8 || len(req.Password) > 72 || req.Password == security.DisabledPasswordValue) {
+		writeError(w, http.StatusBadRequest, "password must be 8 to 72 bytes")
 		return
 	}
 	password := req.Password

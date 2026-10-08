@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"frp-control-server/internal/cluster"
@@ -15,7 +16,26 @@ import (
 )
 
 func (s *Store) PendingEvents(ctx context.Context) ([]cluster.EventEnvelope, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT event_id,event_type,payload,created_at FROM outbound_events WHERE acknowledged_at IS NULL ORDER BY id LIMIT 100`)
+	return s.pendingEvents(ctx, nil)
+}
+
+func (s *Store) PendingEventsForTypes(ctx context.Context, types []string) ([]cluster.EventEnvelope, error) {
+	if len(types) == 0 {
+		return nil, nil
+	}
+	return s.pendingEvents(ctx, types)
+}
+
+func (s *Store) pendingEvents(ctx context.Context, types []string) ([]cluster.EventEnvelope, error) {
+	query := `SELECT event_id,event_type,payload,created_at FROM outbound_events WHERE acknowledged_at IS NULL`
+	args := make([]any, 0, len(types))
+	if len(types) > 0 {
+		query += ` AND event_type IN (` + strings.TrimSuffix(strings.Repeat("?,", len(types)), ",") + `)`
+		for _, kind := range types {
+			args = append(args, kind)
+		}
+	}
+	rows, err := s.db.QueryContext(ctx, query+` ORDER BY id LIMIT 100`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -46,17 +66,32 @@ func (s *Store) AcknowledgeEvents(ctx context.Context, ids []string) error {
 func (s *Store) HeartbeatPayload(ctx context.Context) cluster.HeartbeatPayload {
 	payload := cluster.HeartbeatPayload{}
 	rows, err := s.db.QueryContext(ctx, `SELECT c.user_id,c.token_id,c.client_id,c.last_seen_at,c.frpc_running FROM edge_clients c WHERE c.status='active' AND c.last_seen_at IS NOT NULL`)
+	if err != nil {
+		payload.ReportError = "read edge clients: " + err.Error()
+		return payload
+	}
 	if err == nil {
 		defer rows.Close()
 		for rows.Next() {
 			var p cluster.ClientPresence
 			var seen string
-			_ = rows.Scan(&p.UserID, &p.TokenID, &p.ClientID, &seen, &p.FRPCRunning)
+			if err := rows.Scan(&p.UserID, &p.TokenID, &p.ClientID, &seen, &p.FRPCRunning); err != nil {
+				payload.ReportError = "read edge client: " + err.Error()
+				return payload
+			}
 			if t, e := time.Parse(time.RFC3339Nano, seen); e == nil {
+				if time.Since(t) > 60*time.Second {
+					continue
+				}
 				p.LastSeenAt = &t
 			}
 			payload.Clients = append(payload.Clients, p)
 		}
+		if err := rows.Err(); err != nil {
+			payload.ReportError = "read edge clients: " + err.Error()
+			return payload
+		}
+		rows.Close()
 	}
 	payload.ClientsOnline = len(payload.Clients)
 	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM outbound_events WHERE acknowledged_at IS NULL`).Scan(&payload.PendingEvents)
@@ -64,6 +99,9 @@ func (s *Store) HeartbeatPayload(ctx context.Context) cluster.HeartbeatPayload {
 }
 
 func (s *Store) GetPolicy(ctx context.Context, flow dpiengine.FlowContext) (dpi.Policy, error) {
+	if s.identityResetPending.Load() {
+		return dpi.Policy{}, dpi.ErrPolicySynchronizing
+	}
 	if flow.UserID <= 0 {
 		return dpi.DefaultPolicy(), nil
 	}
@@ -79,6 +117,10 @@ func (s *Store) GetPolicy(ctx context.Context, flow dpiengine.FlowContext) (dpi.
 	err = json.Unmarshal([]byte(encoded), &policy)
 	return policy, err
 }
+
+func (s *Store) DPIPolicy(ctx context.Context, userID int64) (dpi.Policy, error) {
+	return s.GetPolicy(ctx, dpiengine.FlowContext{UserID: userID})
+}
 func (s *Store) RecordDPIEvent(ctx context.Context, event dpi.Event) {
 	eventID, _, err := security.NewOpaqueToken("dpi_")
 	if err == nil {
@@ -90,6 +132,12 @@ func (s *Store) BeginCommand(ctx context.Context, command cluster.NodeCommand) (
 	var status, result string
 	err := s.db.QueryRowContext(ctx, `SELECT status,result FROM received_commands WHERE command_id=?`, command.CommandID).Scan(&status, &result)
 	if err == nil {
+		if status == "executing" {
+			switch command.Command {
+			case "update_edge_runtime_settings", "update_edge_permissions", "update_edge_advanced_settings", "block_ip", "unblock_ip", "disconnect_client", "disconnect_connection":
+				return true, nil, nil // all are idempotent desired-state operations
+			}
+		}
 		var cached cluster.CommandResult
 		if status == "executing" || json.Unmarshal([]byte(result), &cached) != nil {
 			cached = cluster.CommandResult{CommandID: command.CommandID, Status: "failed", Error: "previous command execution did not complete"}
@@ -117,7 +165,7 @@ func (s *Store) DeleteBlockedIP(ctx context.Context, ip string) error {
 	return err
 }
 func (s *Store) ListBlockedIPs(ctx context.Context) ([]db.BlockedInboundIP, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT ip,reason,created_at FROM blocked_inbound_ips`)
+	rows, err := s.db.QueryContext(ctx, `SELECT ip,reason,created_at FROM controller_blocked_ips UNION ALL SELECT ip,reason,created_at FROM blocked_inbound_ips WHERE ip NOT IN (SELECT ip FROM controller_blocked_ips)`)
 	if err != nil {
 		return nil, err
 	}

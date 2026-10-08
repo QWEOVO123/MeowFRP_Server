@@ -38,7 +38,15 @@ type DPIEvent struct {
 }
 
 func (s *Store) RecordEdgeDPIEvent(ctx context.Context, nodeID string, event dpi.Event) error {
-	_, err := s.db.ExecContext(ctx, `INSERT INTO dpi_events(node_id,user_id,token_id,client_id,lease_id,proxy_name,proxy_type,remote_port,local_addr,remote_addr,direction,detector,protocol,host,sni,target_ip,action,reason,summary,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,NULLIF(?,''),NULLIF(?,''),NULLIF(?,''),?,?,?,?)`, nodeID, event.Flow.UserID, event.Flow.TokenID, event.Flow.ClientID, event.Flow.LeaseID, event.Flow.ProxyName, event.Flow.ProxyType, event.Flow.RemotePort, event.Flow.LocalAddr, event.Flow.RemoteAddr, event.Direction, event.Finding.Detector, event.Finding.Protocol, event.Finding.Host, event.Finding.SNI, event.Finding.TargetIP, event.Action, event.Reason, event.Finding.Summary, event.ObservedAt)
+	return insertEdgeDPIEvent(ctx, s.db, nodeID, event)
+}
+
+type dpiEventExecutor interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func insertEdgeDPIEvent(ctx context.Context, executor dpiEventExecutor, nodeID string, event dpi.Event) error {
+	_, err := executor.ExecContext(ctx, `INSERT INTO dpi_events(node_id,user_id,token_id,client_id,lease_id,proxy_name,proxy_type,remote_port,local_addr,remote_addr,direction,detector,protocol,host,sni,target_ip,action,reason,summary,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,NULLIF(?,''),NULLIF(?,''),NULLIF(?,''),?,?,?,?)`, nodeID, event.Flow.UserID, event.Flow.TokenID, event.Flow.ClientID, event.Flow.LeaseID, event.Flow.ProxyName, event.Flow.ProxyType, event.Flow.RemotePort, event.Flow.LocalAddr, event.Flow.RemoteAddr, event.Direction, event.Finding.Detector, event.Finding.Protocol, event.Finding.Host, event.Finding.SNI, event.Finding.TargetIP, event.Action, event.Reason, event.Finding.Summary, event.ObservedAt)
 	return err
 }
 
@@ -88,22 +96,8 @@ func (s *Store) ListDPIPolicies(ctx context.Context) ([]dpi.Policy, error) {
 }
 
 func (s *Store) UpsertDPIPolicy(ctx context.Context, policy dpi.Policy) (dpi.Policy, error) {
-	if policy.Mode == "" {
-		policy.Mode = dpi.ModeMonitor
-	}
-	if len(policy.EnabledDetectors) == 0 {
-		policy.EnabledDetectors = dpi.DefaultPolicy().EnabledDetectors
-	}
-	if policy.MaxInspectBytes <= 0 {
-		policy.MaxInspectBytes = dpi.DefaultPolicy().MaxInspectBytes
-	}
-	if policy.TemporaryBlockTTL <= 0 {
-		policy.TemporaryBlockTTL = dpi.DefaultPolicy().TemporaryBlockTTL
-	}
-	if policy.EncryptedTunnelMode == "" {
-		policy.EncryptedTunnelMode = dpi.ModeMonitor
-	}
-	_, err := s.db.ExecContext(ctx, `
+	policy = normalizeDPIPolicy(policy)
+	_, err := s.execUserIdentityChange(ctx, policy.UserID, `
 		INSERT INTO dpi_user_policies(
 			user_id, enabled, mode, enabled_detectors, block_on_any_finding,
 			allow_http, allow_tls, allow_quic, allow_encrypted_tunnel,
@@ -130,6 +124,25 @@ func (s *Store) UpsertDPIPolicy(ctx context.Context, policy dpi.Policy) (dpi.Pol
 		return dpi.Policy{}, err
 	}
 	return s.GetDPIPolicy(ctx, policy.UserID)
+}
+
+func normalizeDPIPolicy(policy dpi.Policy) dpi.Policy {
+	if policy.Mode == "" {
+		policy.Mode = dpi.ModeMonitor
+	}
+	if policy.EnabledDetectors == nil {
+		policy.EnabledDetectors = dpi.DefaultPolicy().EnabledDetectors
+	}
+	if policy.MaxInspectBytes <= 0 {
+		policy.MaxInspectBytes = dpi.DefaultPolicy().MaxInspectBytes
+	}
+	if policy.TemporaryBlockTTL <= 0 {
+		policy.TemporaryBlockTTL = dpi.DefaultPolicy().TemporaryBlockTTL
+	}
+	if policy.EncryptedTunnelMode == "" {
+		policy.EncryptedTunnelMode = dpi.ModeMonitor
+	}
+	return policy
 }
 
 func (s *Store) RecordDPIEvent(ctx context.Context, event dpi.Event) {

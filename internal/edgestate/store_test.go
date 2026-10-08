@@ -73,6 +73,10 @@ func TestReliableEventsPoliciesAndScopedBlocks(t *testing.T) {
 	if err != nil || !resolved.Enabled || resolved.Mode != dpi.ModeBlock {
 		t.Fatalf("unexpected cached DPI policy: %#v err=%v", resolved, err)
 	}
+	direct, err := store.DPIPolicy(ctx, 7)
+	if err != nil || !direct.Enabled || direct.Mode != dpi.ModeBlock {
+		t.Fatalf("unexpected direct cached DPI policy: %#v err=%v", direct, err)
+	}
 	payload, _ = json.Marshal(cluster.IdentitySnapshot{Revision: 2, DPIPolicies: []dpi.Policy{policy}})
 	if err := store.ApplyIdentitySnapshot(ctx, payload); err != nil {
 		t.Fatal(err)
@@ -113,10 +117,11 @@ func TestIdentitySnapshotSupportsDirectEdgeAuthentication(t *testing.T) {
 	defer store.Close()
 	expires := time.Now().Add(time.Hour)
 	snapshot := cluster.IdentitySnapshot{
-		Revision: 42,
-		Users:    []cluster.SnapshotUser{{ID: 7, Username: "alice", Role: "user", Status: "active"}},
-		Tokens:   []cluster.SnapshotToken{{ID: 9, UserID: 7, Name: "desktop", TokenHash: security.TokenHash("ak_secret"), Status: "active", MaxProxyCount: 2, ExpiresAt: &expires}},
-		Policies: []db.UserResourcePolicy{{UserID: 7, PortStart: 6000, PortEnd: 6010, MaxPorts: 2, AllowedProtocols: []string{"tcp"}, Enabled: true}},
+		Revision:           42,
+		NodeAccessEnforced: true,
+		Users:              []cluster.SnapshotUser{{ID: 7, Username: "alice", Role: "user", Status: "active"}},
+		Tokens:             []cluster.SnapshotToken{{ID: 9, UserID: 7, Name: "desktop", TokenHash: security.TokenHash("ak_secret"), Status: "active", MaxProxyCount: 2, ExpiresAt: &expires}},
+		Policies:           []db.UserResourcePolicy{{UserID: 7, PortStart: 6000, PortEnd: 6010, MaxPorts: 2, AllowedProtocols: []string{"tcp"}, Enabled: true}},
 	}
 	payload, _ := json.Marshal(snapshot)
 	if err := store.ApplyIdentitySnapshot(context.Background(), payload); err != nil {

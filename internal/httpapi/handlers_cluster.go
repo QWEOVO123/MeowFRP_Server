@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -19,6 +18,7 @@ import (
 	"frp-control-server/internal/config"
 	"frp-control-server/internal/db"
 	"frp-control-server/internal/edgestate"
+	"frp-control-server/internal/frpcore"
 	"frp-control-server/internal/security"
 )
 
@@ -109,6 +109,7 @@ func (s *Server) setupEdge(w http.ResponseWriter, r *http.Request) {
 	s.edgeState = state
 	s.store = nil
 	s.mu.Unlock()
+	state.SetDPIEventReporting(s.EdgeDPIEventsEnabled)
 	writeJSON(w, http.StatusCreated, map[string]any{"ok": true, "mode": cfg.Mode, "node_id": result.NodeID, "certificate_expires_at": result.ExpiresAt, "restart_required": true, "config_path": cfg.ConfigPath})
 }
 
@@ -238,6 +239,7 @@ func (s *Server) enrollEdgeNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	nodeID := strings.TrimSpace(req.NodeID)
+	newNode := nodeID == ""
 	if nodeID != "" {
 		if _, err := s.getStore().GetEdgeNode(r.Context(), nodeID); err != nil {
 			writeError(w, http.StatusBadRequest, "requested edge node identity does not exist")
@@ -256,13 +258,33 @@ func (s *Server) enrollEdgeNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err.Error())
 		return
 	}
-	if err := s.getStore().ConsumeEnrollmentToken(r.Context(), secret); err != nil {
+	enrollmentSettings, err := s.getStore().ConsumeEnrollmentTokenSettings(r.Context(), secret)
+	if err != nil {
 		writeError(w, http.StatusUnauthorized, err.Error())
 		return
+	}
+	var options nodeEnrollmentOptions
+	if enrollmentSettings != "" {
+		if err := json.Unmarshal([]byte(enrollmentSettings), &options); err != nil {
+			writeError(w, 500, "invalid saved enrollment settings")
+			return
+		}
+		if newNode && options.Name != "" {
+			req.NodeName = options.Name
+		}
 	}
 	if err := s.getStore().UpsertEdgeNode(r.Context(), db.EdgeNode{NodeID: nodeID, Name: req.NodeName, CertificateSerial: serial, CapabilitiesJSON: "{}"}); err != nil {
 		writeError(w, 500, err.Error())
 		return
+	}
+	if newNode && enrollmentSettings != "" {
+		if err := s.getStore().UpdateEdgeNodeDirectory(r.Context(), nodeID, req.NodeName, options.PublicAPIURL, options.Selectable); err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+	}
+	if s.controllerControl != nil {
+		s.controllerControl.RememberEnrolledNode(r.Context(), nodeID)
 	}
 	host, _, splitErr := net.SplitHostPort(cfg.Controller.PublicAddress)
 	if splitErr != nil {
@@ -272,11 +294,59 @@ func (s *Server) enrollEdgeNode(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, cluster.EnrollmentResponse{NodeID: nodeID, Certificate: string(certPEM), CACertificate: string(material.CACertificate), ExpiresAt: expires, MTLSAddress: cfg.Controller.PublicAddress, MTLSServerName: host})
 }
 
+type nodeEnrollmentOptions struct {
+	Name         string `json:"name"`
+	PublicAPIURL string `json:"public_api_url"`
+	Selectable   bool   `json:"selectable"`
+}
+
 func (s *Server) createNodeEnrollmentToken(w http.ResponseWriter, r *http.Request) {
 	cfg := s.getConfig()
 	if !cfg.Controller.EdgeAccessEnabled {
 		writeError(w, http.StatusConflict, "enable edge node access first")
 		return
+	}
+	var req struct {
+		ExpiresMinutes int                    `json:"expires_minutes"`
+		Node           *nodeEnrollmentOptions `json:"node,omitempty"`
+	}
+	if r.Body != nil && r.ContentLength != 0 {
+		if err := readJSON(r, &req); err != nil {
+			writeError(w, 400, err.Error())
+			return
+		}
+	}
+	if req.ExpiresMinutes == 0 {
+		req.ExpiresMinutes = 10
+	}
+	if req.ExpiresMinutes < 1 || req.ExpiresMinutes > 60 {
+		writeError(w, 400, "token lifetime must be between 1 and 60 minutes")
+		return
+	}
+	settings := ""
+	if req.Node != nil {
+		req.Node.Name = strings.TrimSpace(req.Node.Name)
+		req.Node.PublicAPIURL = strings.TrimRight(strings.TrimSpace(req.Node.PublicAPIURL), "/")
+		if len(req.Node.PublicAPIURL) > 512 {
+			writeError(w, 400, "node API URL is too long")
+			return
+		}
+		if len(req.Node.Name) > 128 {
+			writeError(w, 400, "node name is too long")
+			return
+		}
+		if req.Node.PublicAPIURL != "" || req.Node.Selectable {
+			if err := validatePublicAPIURL(req.Node.PublicAPIURL); err != nil {
+				writeError(w, 400, err.Error())
+				return
+			}
+		}
+		encoded, err := json.Marshal(req.Node)
+		if err != nil {
+			writeError(w, 500, err.Error())
+			return
+		}
+		settings = string(encoded)
 	}
 	if cfg.Controller.TLS.CACertificateBase64 == "" {
 		if err := ensureControllerPKI(&cfg); err != nil {
@@ -296,13 +366,13 @@ func (s *Server) createNodeEnrollmentToken(w http.ResponseWriter, r *http.Reques
 		writeError(w, 500, err.Error())
 		return
 	}
-	expires := time.Now().Add(10 * time.Minute)
+	expires := time.Now().Add(time.Duration(req.ExpiresMinutes) * time.Minute)
 	admin := currentUser(r)
 	var adminID int64
 	if admin != nil {
 		adminID = admin.ID
 	}
-	if err := s.getStore().CreateEnrollmentToken(r.Context(), plain, security.TokenPrefix(plain), 1, expires, adminID); err != nil {
+	if err := s.getStore().CreateEnrollmentTokenWithSettings(r.Context(), plain, security.TokenPrefix(plain), 1, expires, adminID, settings); err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
@@ -382,6 +452,30 @@ func controllerDirectoryItem(cfg config.Config, r *http.Request) map[string]any 
 	return map[string]any{"node_id": "controller", "tag": controllerTag, "api_url": controllerURL, "online": true, "node_type": "controller"}
 }
 
+func (s *Server) deleteEdgeNode(w http.ResponseWriter, r *http.Request) {
+	nodeID := strings.TrimSpace(r.PathValue("id"))
+	if nodeID == "" || nodeID == "controller" {
+		writeError(w, 400, "只能删除边缘节点，不能删除中心自身")
+		return
+	}
+	store := s.getStore()
+	if err := store.DeleteEdgeNode(r.Context(), nodeID); err != nil {
+		if errors.Is(err, db.ErrNotFound) {
+			writeError(w, 404, "节点不存在或已删除")
+			return
+		}
+		writeError(w, 500, "删除节点失败："+err.Error())
+		return
+	}
+	if s.controllerControl != nil {
+		s.controllerControl.ForgetNode(nodeID)
+	}
+	if admin := currentUser(r); admin != nil {
+		store.Audit(r.Context(), "admin", admin.ID, "delete_node", "node", nodeID, "registration, user grants and node telemetry removed")
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
 func (s *Server) updateEdgeNode(w http.ResponseWriter, r *http.Request) {
 	nodeID := strings.TrimSpace(r.PathValue("id"))
 	var req struct {
@@ -400,21 +494,32 @@ func (s *Server) updateEdgeNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Selectable {
-		u, err := url.Parse(req.PublicAPIURL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			writeError(w, http.StatusBadRequest, "public_api_url must be an absolute HTTP(S) URL")
+		if err := validatePublicAPIURL(req.PublicAPIURL); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	}
-	if err := s.getStore().UpdateEdgeNodeDirectory(r.Context(), nodeID, req.Name, req.PublicAPIURL, req.Selectable); err != nil {
-		if errors.Is(err, db.ErrNotFound) {
-			writeError(w, http.StatusNotFound, "node not found")
-		} else {
-			writeError(w, 500, err.Error())
-		}
+	// Keep the legacy endpoint compatible, but never change just the catalog.
+	capabilities, ok := s.edgeConfigurationCapabilities(w, r, nodeID, true)
+	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	var reported struct {
+		Runtime *config.NodeRuntimeConfig `json:"runtime_settings"`
+	}
+	if json.Unmarshal(capabilities, &reported) != nil || reported.Runtime == nil {
+		writeError(w, http.StatusConflict, "edge node has not reported its runtime settings")
+		return
+	}
+	node := *reported.Runtime
+	node.Tag, node.PublicAPIURL, node.Selectable = req.Name, req.PublicAPIURL, req.Selectable
+	node = normalizeNodeRuntime(node)
+	if err := validateNodeRuntime(node); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	payload, _ := json.Marshal(node)
+	s.queueEdgeConfiguration(w, r, nodeID, "update_edge_runtime_settings", payload)
 }
 
 func (s *Server) updateEdgeRemotePermissions(w http.ResponseWriter, r *http.Request) {
@@ -427,42 +532,11 @@ func (s *Server) updateEdgeRemotePermissions(w http.ResponseWriter, r *http.Requ
 		writeError(w, 400, "invalid edge permissions")
 		return
 	}
-	node, err := s.getStore().GetEdgeNode(r.Context(), nodeID)
-	if err != nil {
-		if errors.Is(err, db.ErrNotFound) {
-			writeError(w, 404, "node not found")
-		} else {
-			writeError(w, 500, err.Error())
-		}
-		return
-	}
-	capabilities := json.RawMessage(node.CapabilitiesJSON)
-	if s.controllerControl != nil {
-		if _, live := s.controllerControl.NodeSession(nodeID); len(live) > 0 {
-			capabilities = live
-		}
-	}
-	if !controllerAdministrationAllowed(capabilities) {
-		writeError(w, http.StatusForbidden, "edge node has not enabled controller administration")
+	if _, ok := s.edgeConfigurationCapabilities(w, r, nodeID, false); !ok {
 		return
 	}
 	payload, _ := json.Marshal(req)
-	commandID, _, err := security.NewOpaqueToken("cmd_")
-	if err != nil {
-		writeError(w, 500, err.Error())
-		return
-	}
-	expiresAt := time.Now().Add(10 * time.Minute)
-	command := cluster.NodeCommand{CommandID: commandID, NodeID: nodeID, Command: "update_edge_permissions", Payload: payload, ExpiresAt: expiresAt}
-	if err := s.getStore().CreateNodeCommand(r.Context(), db.NodeCommandRecord{CommandID: commandID, NodeID: nodeID, CommandType: command.Command, PayloadJSON: string(payload), ExpiresAt: expiresAt}); err != nil {
-		writeError(w, 500, err.Error())
-		return
-	}
-	delivered := s.controllerControl != nil && s.controllerControl.SendCommand(command)
-	if delivered {
-		_ = s.getStore().MarkNodeCommandDelivered(r.Context(), commandID)
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "command_id": commandID, "delivered": delivered})
+	s.queueEdgeConfiguration(w, r, nodeID, "update_edge_permissions", payload)
 }
 
 func (s *Server) updateEdgeRuntimeSettings(w http.ResponseWriter, r *http.Request) {
@@ -477,6 +551,14 @@ func (s *Server) updateEdgeRuntimeSettings(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if _, ok := s.edgeConfigurationCapabilities(w, r, nodeID, true); !ok {
+		return
+	}
+	payload, _ := json.Marshal(req)
+	s.queueEdgeConfiguration(w, r, nodeID, "update_edge_runtime_settings", payload)
+}
+
+func (s *Server) edgeConfigurationCapabilities(w http.ResponseWriter, r *http.Request, nodeID string, runtime bool) (json.RawMessage, bool) {
 	node, err := s.getStore().GetEdgeNode(r.Context(), nodeID)
 	if err != nil {
 		if errors.Is(err, db.ErrNotFound) {
@@ -484,7 +566,7 @@ func (s *Server) updateEdgeRuntimeSettings(w http.ResponseWriter, r *http.Reques
 		} else {
 			writeError(w, 500, err.Error())
 		}
-		return
+		return nil, false
 	}
 	capabilities := json.RawMessage(node.CapabilitiesJSON)
 	if s.controllerControl != nil {
@@ -492,34 +574,61 @@ func (s *Server) updateEdgeRuntimeSettings(w http.ResponseWriter, r *http.Reques
 			capabilities = live
 		}
 	}
-	if !controllerAdministrationAllowed(capabilities) || !runtimeSettingsAllowed(capabilities) {
-		writeError(w, http.StatusForbidden, "edge node has not enabled remote runtime settings")
+	if !controllerAdministrationAllowed(capabilities) || (runtime && !runtimeSettingsAllowed(capabilities)) {
+		writeError(w, http.StatusForbidden, "edge node has not enabled the required controller management permissions")
+		return nil, false
+	}
+	return capabilities, true
+}
+
+// Ordinary configuration commands survive reconnects. An online response is
+// successful only after the edge confirms persistence through its mTLS stream.
+func (s *Server) queueEdgeConfiguration(w http.ResponseWriter, r *http.Request, nodeID, kind string, payload json.RawMessage) {
+	// Monotonic desired-state versions fence late/offline command delivery.
+	revision, err := s.getStore().NextIdentityRevision(r.Context())
+	if err != nil {
+		writeError(w, 500, "allocate configuration revision failed")
 		return
 	}
-	payload, _ := json.Marshal(req)
+	var versioned map[string]json.RawMessage
+	if err = json.Unmarshal(payload, &versioned); err != nil {
+		writeError(w, 400, "invalid configuration payload")
+		return
+	}
+	versioned["_configuration_revision"], _ = json.Marshal(revision)
+	payload, _ = json.Marshal(versioned)
 	commandID, _, err := security.NewOpaqueToken("cmd_")
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
 	expiresAt := time.Now().Add(10 * time.Minute)
-	command := cluster.NodeCommand{CommandID: commandID, NodeID: nodeID, Command: "update_edge_runtime_settings", Payload: payload, ExpiresAt: expiresAt}
+	command := cluster.NodeCommand{CommandID: commandID, NodeID: nodeID, Command: kind, Payload: payload, ExpiresAt: expiresAt}
 	if err := s.getStore().CreateNodeCommand(r.Context(), db.NodeCommandRecord{CommandID: commandID, NodeID: nodeID, CommandType: command.Command, PayloadJSON: string(payload), ExpiresAt: expiresAt}); err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
-	delivered := s.controllerControl != nil && s.controllerControl.SendCommand(command)
-	if delivered {
-		_ = s.getStore().MarkNodeCommandDelivered(r.Context(), commandID)
+	delivered := false
+	if s.controllerControl != nil {
+		if online, _ := s.controllerControl.NodeSession(nodeID); online {
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			result, sendErr := s.controllerControl.SendCommandAndWait(ctx, command)
+			cancel()
+			delivered = sendErr == nil || errors.Is(sendErr, context.DeadlineExceeded) || errors.Is(sendErr, context.Canceled)
+			if delivered {
+				_ = s.getStore().MarkNodeCommandDelivered(r.Context(), commandID)
+			}
+			if sendErr == nil {
+				if result.Status != "succeeded" {
+					writeError(w, http.StatusConflict, "edge rejected configuration: "+result.Error)
+					return
+				}
+				writeJSON(w, http.StatusOK, map[string]any{"ok": true, "command_id": commandID, "delivered": true, "applied": true, "result": result.Result})
+				return
+			}
+		}
 	}
-	// The directory is Controller-owned. A runtime settings change initiated by
-	// the Controller updates it in the same operation; local Edge changes remain
-	// advisory until an administrator confirms them here.
-	if err := s.getStore().UpdateEdgeNodeDirectory(r.Context(), nodeID, req.Tag, req.PublicAPIURL, req.Selectable); err != nil {
-		writeError(w, 500, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "command_id": commandID, "delivered": delivered})
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "command_id": commandID, "delivered": delivered, "applied": false, "persistent": true, "expires_at": nil})
 }
 
 func (s *Server) rotateEdgeAdminCredentials(w http.ResponseWriter, r *http.Request) {
@@ -646,9 +755,13 @@ func (s *Server) createEdgeCommand(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, "invalid IP address")
 			return
 		}
-		p.IP = addr.String()
+		p.IP = addr.Unmap().String()
 		req.Payload, _ = json.Marshal(p)
 		if req.Scope == "global" {
+			if s.controllerControl != nil {
+				unlock := s.controllerControl.LockIdentityMutation()
+				defer unlock()
+			}
 			admin := currentUser(r)
 			if req.Command == "block_ip" {
 				_, err = s.getStore().UpsertBlockedInboundIP(r.Context(), p.IP, p.Reason, admin.ID)
@@ -659,9 +772,32 @@ func (s *Server) createEdgeCommand(w http.ResponseWriter, r *http.Request) {
 				writeError(w, 500, err.Error())
 				return
 			}
+			if s.core != nil {
+				if req.Command == "block_ip" {
+					s.core.BlockInboundIP(p.IP, p.Reason)
+				} else {
+					s.core.UnblockInboundIP(p.IP)
+				}
+			}
+			if s.controllerControl != nil {
+				s.controllerControl.ScheduleBlockedIPPush()
+			}
+			writeJSON(w, 202, map[string]any{"ok": true, "scope": "global", "sync": "incremental; full baseline after reconnect"})
+			return
 		}
 	}
 	targets := []string{nodeID}
+	waitForResult := req.Scope != "global" && (req.Command == "disconnect_client" || req.Command == "disconnect_connection")
+	if waitForResult {
+		if s.controllerControl == nil {
+			writeError(w, 503, "中心控制通道不可用")
+			return
+		}
+		if online, _ := s.controllerControl.NodeSession(nodeID); !online {
+			writeError(w, 503, "边缘节点离线，无法执行踢出")
+			return
+		}
+	}
 	if req.Scope == "global" && s.controllerControl != nil {
 		targets = s.controllerControl.ConnectedNodes()
 	}
@@ -677,12 +813,29 @@ func (s *Server) createEdgeCommand(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 500, err.Error())
 			return
 		}
-		if s.controllerControl != nil && s.controllerControl.SendCommand(command) {
+		if waitForResult {
+			ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
+			result, err := s.controllerControl.SendCommandAndWait(ctx, command)
+			cancel()
+			if err != nil {
+				writeError(w, 504, "命令执行结果未确认，请刷新节点核对："+err.Error())
+				return
+			}
+			encoded, _ := json.Marshal(result)
+			if err := s.getStore().CompleteNodeCommand(r.Context(), target, id, result.Status, string(encoded)); err != nil {
+				writeError(w, 500, err.Error())
+				return
+			}
+			if result.Status != "succeeded" {
+				writeError(w, 409, result.Error)
+				return
+			}
+		} else if s.controllerControl != nil && s.controllerControl.SendCommand(command) {
 			_ = s.getStore().MarkNodeCommandDelivered(r.Context(), id)
 		}
 		created = append(created, id)
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "command_ids": created})
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "command_ids": created, "completed": waitForResult})
 }
 
 func (s *Server) listEdgeClients(w http.ResponseWriter, r *http.Request) {
@@ -777,26 +930,25 @@ func (s *Server) EdgePendingEvents(ctx context.Context) ([]cluster.EventEnvelope
 	if s.edgeState == nil {
 		return nil, nil
 	}
-	events, err := s.edgeState.PendingEvents(ctx)
-	if err != nil {
+	reporting := s.getConfig().Edge.Reporting
+	types := []string{}
+	if reporting.DPIEvents {
+		types = append(types, "dpi_event")
+	} else if err := s.edgeState.PruneDisabledDPIEvents(ctx); err != nil {
 		return nil, err
 	}
-	reporting := s.getConfig().Edge.Reporting
-	filtered := events[:0]
-	for _, event := range events {
-		if event.EventType == "dpi_event" && !reporting.DPIEvents {
-			continue
-		}
-		if event.EventType == "runtime_log" && !reporting.RuntimeLogs {
-			continue
-		}
-		filtered = append(filtered, event)
+	if reporting.RuntimeLogs {
+		types = append(types, "runtime_log")
 	}
-	return filtered, nil
+	return s.edgeState.PendingEventsForTypes(ctx, types)
 }
 
 func (s *Server) EdgeRuntimeLogsEnabled() bool {
 	return s.getConfig().Mode == config.ModeEdge && s.getConfig().Edge.Reporting.RuntimeLogs
+}
+
+func (s *Server) EdgeDPIEventsEnabled() bool {
+	return s.getConfig().Mode == config.ModeEdge && s.getConfig().Edge.Reporting.DPIEvents
 }
 
 // HandleObservedAddress migrates a loopback/unspecified automatic default to
@@ -834,12 +986,26 @@ func (s *Server) HandleEdgeCommand(ctx context.Context, command cluster.NodeComm
 	execute, cached, err := s.edgeState.BeginCommand(ctx, command)
 	if err != nil {
 		result.Error = err.Error()
+		result.Status = "retry"
 		return result
 	}
 	if !execute && cached != nil {
 		return *cached
 	}
-	if !command.ExpiresAt.IsZero() && time.Now().After(command.ExpiresAt) {
+	if superseded, err := s.edgeState.ConfigurationSuperseded(ctx, command.Command, command.Payload); err != nil {
+		result.Status = "retry"
+		result.Error = "read configuration revision: " + err.Error()
+		return result
+	} else if superseded {
+		result.Status = "succeeded"
+		result.Result = json.RawMessage(`{"superseded":true}`)
+		if err := s.edgeState.FinishCommand(ctx, result); err != nil {
+			result.Status = "retry"
+			result.Error = err.Error()
+		}
+		return result
+	}
+	if command.Command != "update_edge_runtime_settings" && command.Command != "update_edge_permissions" && command.Command != "update_edge_advanced_settings" && !command.ExpiresAt.IsZero() && time.Now().After(command.ExpiresAt) {
 		result.Error = "command expired before execution"
 		_ = s.edgeState.FinishCommand(ctx, result)
 		return result
@@ -895,11 +1061,40 @@ func (s *Server) HandleEdgeCommand(ctx context.Context, command cluster.NodeComm
 			break
 		}
 		s.setRuntime(cfg, s.getStore())
+		restartRequired = s.noteSettingsRestart(cfg, restartRequired)
 		if s.edgeClient != nil {
 			s.edgeClient.SetCapabilities(edgeCapabilities(cfg))
 		}
 		result.Status = "succeeded"
 		output = map[string]any{"runtime_settings": cfg.Node, "restart_required": restartRequired}
+	case "update_edge_advanced_settings":
+		if !cfg.Edge.ControllerAdministrationEnabled || !cfg.Edge.RemoteCommands.ChangeRuntimeSettings {
+			result.Error = "remote runtime settings are disabled on this edge"
+			break
+		}
+		var advanced edgeAdvancedSettings
+		if json.Unmarshal(command.Payload, &advanced) != nil {
+			result.Error = "invalid edge advanced settings payload"
+			break
+		}
+		oldCfg := cfg
+		if err := applyEdgeAdvancedSettings(&cfg, advanced); err != nil {
+			result.Error = err.Error()
+			break
+		}
+		if err := config.WriteFileConfig(cfg.ConfigPath, cfg.FileConfig()); err != nil {
+			result.Error = "write edge config failed: " + err.Error()
+			break
+		}
+		s.setRuntime(cfg, s.getStore())
+		restartRequired := s.noteSettingsRestart(cfg, oldCfg.EmbeddedFRPEnabled != cfg.EmbeddedFRPEnabled ||
+			oldCfg.FRPTransportTLS != cfg.FRPTransportTLS || oldCfg.FRPBindAddr != cfg.FRPBindAddr ||
+			oldCfg.FRPProxyBindAddr != cfg.FRPProxyBindAddr || oldCfg.ConnectionTuning != cfg.ConnectionTuning)
+		if s.edgeClient != nil {
+			s.edgeClient.SetCapabilities(edgeCapabilities(cfg))
+		}
+		result.Status = "succeeded"
+		output = map[string]any{"advanced_settings": edgeAdvancedSnapshot(cfg), "restart_required": restartRequired}
 	case "disconnect_client":
 		if !cfg.Edge.RemoteCommands.DisconnectClient {
 			result.Error = "disconnect_client is disabled on this edge"
@@ -914,17 +1109,16 @@ func (s *Server) HandleEdgeCommand(ctx context.Context, command cluster.NodeComm
 			result.Error = "invalid client payload"
 			break
 		}
-		if err := s.edgeState.RevokeClient(ctx, p.TokenID, p.ClientID); err != nil {
-			result.Error = err.Error()
-			break
-		}
-		if err := s.edgeState.EnqueueClientCommand(ctx, p.TokenID, p.ClientID, "reauth", p.Reason); err != nil {
+		leases, err := s.edgeState.DisconnectClientForCommand(ctx, command.CommandID, p.TokenID, p.ClientID, p.Reason)
+		if err != nil {
 			result.Error = err.Error()
 			break
 		}
 		terminated := 0
 		if s.core != nil {
-			terminated = s.core.TerminateConnectionsForClient(p.TokenID, p.ClientID)
+			for _, id := range leases {
+				terminated += s.core.TerminateConnectionsForLease(id)
+			}
 		}
 		output = map[string]any{"terminated_connections": terminated}
 		result.Status = "succeeded"
@@ -998,6 +1192,15 @@ func (s *Server) HandleEdgeCommand(ctx context.Context, command cluster.NodeComm
 		}
 		if s.core != nil {
 			s.core.UnblockInboundIP(p.IP)
+			// Removing a node-local ban must not override the global scope.
+			if blocks, err := s.edgeState.ListBlockedIPs(ctx); err == nil {
+				for _, block := range blocks {
+					if block.IP == p.IP {
+						s.core.SetBlockedInboundIP(frpcore.BlockedInboundIP{IP: block.IP, Reason: block.Reason, CreatedAt: block.CreatedAt})
+						break
+					}
+				}
+			}
 		}
 		output = map[string]any{"ip": p.IP}
 		result.Status = "succeeded"
@@ -1007,7 +1210,17 @@ func (s *Server) HandleEdgeCommand(ctx context.Context, command cluster.NodeComm
 	if output != nil {
 		result.Result, _ = json.Marshal(output)
 	}
-	_ = s.edgeState.FinishCommand(ctx, result)
+	if result.Status == "succeeded" {
+		if err := s.edgeState.ConfirmConfiguration(ctx, command.Command, command.Payload); err != nil {
+			result.Status = "retry"
+			result.Error = "persist configuration revision: " + err.Error()
+			return result
+		}
+	}
+	if err := s.edgeState.FinishCommand(ctx, result); err != nil {
+		result.Status = "retry"
+		result.Error = "persist edge command result: " + err.Error()
+	}
 	return result
 }
 
@@ -1062,7 +1275,8 @@ func edgeCapabilities(cfg config.Config) map[string]any {
 		"reporting": cfg.Edge.Reporting, "remote_commands": cfg.Edge.RemoteCommands,
 		"controller_administration_enabled": cfg.Edge.ControllerAdministrationEnabled,
 		"admin_username":                    cfg.InitialAdmin.Username, "admin_display_name": cfg.InitialAdmin.DisplayName,
-		"runtime_settings": cfg.Node,
+		"runtime_settings":  cfg.Node,
+		"advanced_settings": edgeAdvancedSnapshot(cfg),
 	}
 }
 

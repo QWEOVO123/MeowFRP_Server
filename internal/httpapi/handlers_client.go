@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -60,7 +61,7 @@ func (s *Server) clientResourcePolicy(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":     false,
 			"status": "rejected",
-			"reason": "resource policy is not configured",
+			"reason": "资源策略尚未配置或已禁用，请在中心用户详情中检查资源策略并保存",
 		})
 		return
 	}
@@ -94,6 +95,10 @@ func clientDPIStatus(ctx context.Context, store *db.Store, userID int64) clientD
 	if err != nil {
 		policy = dpipolicy.DefaultPolicy()
 	}
+	return clientDPISummaryFromPolicy(policy)
+}
+
+func clientDPISummaryFromPolicy(policy dpipolicy.Policy) clientDPISummary {
 	enabledDetectors := normalizeDPIDetectors(policy.EnabledDetectors)
 	if len(enabledDetectors) == 0 {
 		enabledDetectors = normalizeDPIDetectors(dpipolicy.DefaultPolicy().EnabledDetectors)
@@ -157,6 +162,8 @@ func dpiTypeAllowed(policy dpipolicy.Policy, trafficType string) bool {
 }
 
 func (s *Server) clientBootstrap(w http.ResponseWriter, r *http.Request) {
+	s.bootstrapMu.Lock()
+	defer s.bootstrapMu.Unlock()
 	if s.getConfig().Mode == config.ModeEdge {
 		s.edgeClientBootstrap(w, r)
 		return
@@ -197,7 +204,7 @@ func (s *Server) clientBootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	allocations, err := s.validateBootstrapProxies(r.Context(), user, token, req.Proxies)
+	allocations, err := s.validateBootstrapProxies(r.Context(), user, token, req.Proxies, req.ClientID)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "status": "rejected", "reason": err.Error()})
 		return
@@ -213,34 +220,39 @@ func (s *Server) clientBootstrap(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	expiresAt := time.Now().Add(s.cfg.RuntimeTokenTTL)
+	cfg := s.getConfig()
+	expiresAt := time.Now().Add(cfg.RuntimeTokenTTL)
 	if err := store.CreateRuntimeLease(r.Context(), leaseID, user.ID, token.ID, req.ClientID, runtimeHash, security.TokenPrefix(runtimeToken), expiresAt, allocations); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	config := s.renderFrpcConfig(user, leaseID, runtimeToken, allocations)
+	frpcConfig := s.renderFrpcConfig(user, leaseID, runtimeToken, allocations)
 	store.Audit(r.Context(), "client", client.ID, "bootstrap", "lease", leaseID, fmt.Sprintf("allocated %d proxies", len(allocations)))
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":           true,
 		"lease_id":     leaseID,
 		"expires_at":   expiresAt,
-		"expires_in":   int(s.cfg.RuntimeTokenTTL.Seconds()),
-		"frpc_config":  config,
+		"expires_in":   int(cfg.RuntimeTokenTTL.Seconds()),
+		"frpc_config":  frpcConfig,
 		"allocations":  allocations,
-		"frp_server":   s.cfg.FRPServerAddr,
-		"frp_port":     s.cfg.FRPServerPort,
+		"frp_server":   cfg.FRPServerAddr,
+		"frp_port":     cfg.FRPServerPort,
 		"token_prefix": security.TokenPrefix(runtimeToken),
 	})
 }
 
-func (s *Server) validateBootstrapProxies(ctx context.Context, user *db.User, token *db.AccessToken, proxies []db.ProxyAllocationInput) ([]db.ProxyAllocationInput, error) {
+func (s *Server) validateBootstrapProxies(ctx context.Context, user *db.User, token *db.AccessToken, proxies []db.ProxyAllocationInput, clientIDs ...string) ([]db.ProxyAllocationInput, error) {
+	clientID := ""
+	if len(clientIDs) > 0 {
+		clientID = clientIDs[0]
+	}
 	if len(proxies) == 0 {
 		return nil, fmt.Errorf("at least one proxy is required")
 	}
 	policy, err := s.store.GetUserResourcePolicy(ctx, user.ID)
 	if err != nil || !policy.Enabled {
-		return nil, fmt.Errorf("resource policy is not configured")
+		return nil, fmt.Errorf("资源策略尚未配置或已禁用，请在中心用户详情中检查资源策略并保存")
 	}
 	if policy.MaxPorts > 0 && len(proxies) > policy.MaxPorts {
 		return nil, fmt.Errorf("proxy count %d exceeds user limit %d", len(proxies), policy.MaxPorts)
@@ -253,17 +265,28 @@ func (s *Server) validateBootstrapProxies(ctx context.Context, user *db.User, to
 	if !rangeAvailable {
 		return nil, fmt.Errorf("node and user port ranges do not overlap")
 	}
-	grants, _ := s.store.ListPortGrants(ctx, token.ID)
+	grants, err := s.store.ListPortGrants(ctx, token.ID)
+	if err != nil {
+		return nil, fmt.Errorf("read token grants: %w", err)
+	}
 	var normalized []db.ProxyAllocationInput
 	requestedPorts := map[string]bool{}
+	requestedNames := map[string]bool{}
 	for _, proxy := range proxies {
 		proxy.ProxyName = strings.TrimSpace(proxy.ProxyName)
 		proxy.ProxyType = normalizeProtocol(proxy.ProxyType)
 		proxy.LocalIP = strings.TrimSpace(proxy.LocalIP)
 		proxy.Domain = strings.TrimSpace(proxy.Domain)
 		proxy.Subdomain = strings.TrimSpace(proxy.Subdomain)
-		if proxy.ProxyName == "" || proxy.ProxyType == "" || proxy.LocalPort <= 0 {
+		if proxy.ProxyName == "" || proxy.ProxyType == "" || proxy.LocalPort <= 0 || proxy.LocalPort > 65535 {
 			return nil, fmt.Errorf("proxy name, supported type and local_port are required")
+		}
+		if requestedNames[proxy.ProxyName] {
+			return nil, fmt.Errorf("proxy name %s is duplicated", proxy.ProxyName)
+		}
+		requestedNames[proxy.ProxyName] = true
+		if len(proxy.ProxyName) > 48 {
+			return nil, fmt.Errorf("proxy name must not exceed 48 bytes")
 		}
 		if proxy.LocalIP == "" {
 			proxy.LocalIP = "127.0.0.1"
@@ -285,7 +308,7 @@ func (s *Server) validateBootstrapProxies(ctx context.Context, user *db.User, to
 			return nil, fmt.Errorf("remote port %d is duplicated in this request", proxy.RemotePort)
 		}
 		requestedPorts[portKey] = true
-		if used, err := s.store.RemotePortInUse(ctx, proxy.ProxyType, proxy.RemotePort); err != nil {
+		if used, err := s.store.RemotePortInUseExceptClient(ctx, proxy.ProxyType, proxy.RemotePort, token.ID, clientID); err != nil {
 			return nil, err
 		} else if used {
 			return nil, fmt.Errorf("remote port %d is already in use on this node", proxy.RemotePort)
@@ -311,14 +334,27 @@ func (s *Server) validateExistingAccessTokenRequest(r *http.Request, store *db.S
 func (s *Server) validateAccessTokenRequestWithClientMode(r *http.Request, store *db.Store, accessToken, clientID string, createClient bool) (*db.AccessToken, *db.User, *db.Client, map[string]any) {
 	token, err := store.GetAccessTokenByHash(r.Context(), security.TokenHash(accessToken))
 	if err != nil {
+		if !errors.Is(err, db.ErrNotFound) {
+			return nil, nil, nil, s.databaseRejection(err)
+		}
 		return nil, nil, nil, map[string]any{"ok": false, "status": "unauthorized", "reason": "invalid access token"}
 	}
 	user, err := store.GetUserByID(r.Context(), token.UserID)
 	if err != nil {
+		if !errors.Is(err, db.ErrNotFound) {
+			return nil, nil, nil, s.databaseRejection(err)
+		}
 		return nil, nil, nil, map[string]any{"ok": false, "status": "unauthorized", "reason": "invalid token owner"}
 	}
 	if user.Role != "user" {
 		return nil, nil, nil, map[string]any{"ok": false, "status": "unauthorized", "reason": "admin accounts cannot use frp access"}
+	}
+	allowed, accessErr := store.CanAccessNode(r.Context(), user.ID, "controller")
+	if accessErr != nil {
+		return nil, nil, nil, s.databaseRejection(accessErr)
+	}
+	if !allowed {
+		return nil, nil, nil, map[string]any{"ok": false, "status": "forbidden", "reason": "该账号没有此节点的使用权限"}
 	}
 	if user.Status == "banned" {
 		return nil, nil, nil, map[string]any{"ok": false, "status": "banned", "reason": user.BanReason}
@@ -339,17 +375,24 @@ func (s *Server) validateAccessTokenRequestWithClientMode(r *http.Request, store
 	if createClient {
 		client, err = store.FindOrCreateClient(r.Context(), user.ID, token.ID, clientID)
 		if err != nil {
-			return nil, nil, nil, map[string]any{"ok": false, "status": "error", "reason": err.Error()}
+			return nil, nil, nil, s.databaseRejection(err)
 		}
 	} else {
 		client, err = store.GetClient(r.Context(), token.ID, clientID)
 		if err != nil {
+			if !errors.Is(err, db.ErrNotFound) {
+				return nil, nil, nil, s.databaseRejection(err)
+			}
 			return nil, nil, nil, map[string]any{"ok": false, "status": "heartbeat_required", "reason": "client heartbeat is required before bootstrap"}
 		}
 	}
 	if client.Status == "banned" {
 		return nil, nil, nil, map[string]any{"ok": false, "status": "banned", "reason": client.BanReason}
 	}
+	if s.clientIsDraining(client.TokenID, client.ClientID) && strings.HasSuffix(r.URL.Path, "/bootstrap") {
+		return nil, nil, nil, map[string]any{"ok": false, "status": "node_fault", "reason": "节点异常：请关闭全部穿透端口后重新登录"}
+	}
+	s.rememberClient(accessToken, client, strings.HasSuffix(r.URL.Path, "/resource-policy"))
 	return token, user, client, nil
 }
 
@@ -391,16 +434,19 @@ func (s *Server) renderFrpcConfig(user *db.User, leaseID, runtimeToken string, p
 	fmt.Fprintf(&b, "# %s\n", cfg.ClientConfigComment)
 	fmt.Fprintf(&b, "serverAddr = %q\n", cfg.FRPServerAddr)
 	fmt.Fprintf(&b, "serverPort = %d\n", cfg.FRPServerPort)
+	b.WriteString("loginFailExit = false\nlog.disablePrintColor = true\n")
 	fmt.Fprintf(&b, "user = %q\n", fmt.Sprintf("u%d", user.ID))
-	if cfg.FRPTransportTLS {
-		b.WriteString("transport.tls.enable = true\n")
+	fmt.Fprintf(&b, "transport.tls.enable = %t\n", cfg.FRPTransportTLS)
+	fmt.Fprintf(&b, "transport.tcpMux = %t\n", !cfg.ConnectionTuning.DisableTCPMux)
+	if cfg.ConnectionTuning.TCPMuxKeepaliveSeconds > 0 {
+		fmt.Fprintf(&b, "transport.tcpMuxKeepaliveInterval = %d\n", cfg.ConnectionTuning.TCPMuxKeepaliveSeconds)
 	}
 	fmt.Fprintf(&b, "metadatas.token = %q\n", runtimeToken)
 	fmt.Fprintf(&b, "metadatas.lease_id = %q\n\n", leaseID)
 
 	for _, proxy := range proxies {
 		fmt.Fprintf(&b, "[[proxies]]\n")
-		fmt.Fprintf(&b, "name = %q\n", proxy.ProxyName)
+		fmt.Fprintf(&b, "name = %q\n", leaseID+"."+proxy.ProxyName)
 		fmt.Fprintf(&b, "type = %q\n", proxy.ProxyType)
 		fmt.Fprintf(&b, "localIP = %q\n", proxy.LocalIP)
 		fmt.Fprintf(&b, "localPort = %d\n", proxy.LocalPort)

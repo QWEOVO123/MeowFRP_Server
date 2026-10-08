@@ -153,7 +153,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 			return err
 		}
 	}
-	return nil
+	// Backfill only missing policies; never overwrite administrator restrictions.
+	_, err := s.db.ExecContext(ctx, `INSERT INTO user_resource_policies(user_id,port_start,port_end,max_ports,allowed_protocols,enabled) SELECT u.id,1024,65535,1,'tcp,udp',TRUE FROM users u LEFT JOIN user_resource_policies p ON p.user_id=u.id WHERE u.role='user' AND p.user_id IS NULL ON DUPLICATE KEY UPDATE user_id=VALUES(user_id)`)
+	return err
 }
 
 func isDuplicateMigrationError(err error) bool {
@@ -322,6 +324,9 @@ func (s *Store) CreateUserWithAccessToken(ctx context.Context, username, display
 		return nil, nil, err
 	}
 	tokenID, _ := res.LastInsertId()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO user_resource_policies(user_id,port_start,port_end,max_ports,allowed_protocols,enabled) VALUES(?,1024,65535,1,'tcp,udp',TRUE)`, userID); err != nil {
+		return nil, nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, nil, err
 	}
@@ -337,7 +342,7 @@ func (s *Store) CreateUserWithAccessToken(ctx context.Context, username, display
 }
 
 func (s *Store) SetUserStatus(ctx context.Context, id int64, status, reason string) error {
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.execUserIdentityChange(ctx, id, `
 		UPDATE users SET status=?, ban_reason=NULLIF(?, ''), updated_at=CURRENT_TIMESTAMP(3) WHERE id=?
 	`, status, reason, id)
 	return err
@@ -381,12 +386,16 @@ func (s *Store) DeleteUser(ctx context.Context, id int64) error {
 		`DELETE FROM user_resource_policies WHERE user_id=?`,
 		`DELETE FROM dpi_block_rules WHERE user_id=?`,
 		`DELETE FROM dpi_user_policies WHERE user_id=?`,
+		`DELETE FROM user_node_access WHERE user_id=?`,
 		`DELETE FROM users WHERE id=?`,
 	}
 	for _, statement := range statements {
 		if _, err := tx.ExecContext(ctx, statement, id); err != nil {
 			return err
 		}
+	}
+	if err := markUserIdentityDirtyTx(ctx, tx, id); err != nil {
+		return err
 	}
 
 	return tx.Commit()
@@ -397,7 +406,7 @@ func (s *Store) UpsertUserResourcePolicy(ctx context.Context, policy UserResourc
 		policy.MaxPorts = 1
 	}
 	allowedProtocols := JoinProtocols(policy.AllowedProtocols)
-	_, err := s.db.ExecContext(ctx, `
+	_, err := s.execUserIdentityChange(ctx, policy.UserID, `
 		INSERT INTO user_resource_policies(user_id, port_start, port_end, max_ports, allowed_protocols, enabled)
 		VALUES(?, ?, ?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE
@@ -443,7 +452,7 @@ func (s *Store) ListUserResourcePolicies(ctx context.Context) ([]UserResourcePol
 }
 
 func (s *Store) CreateAccessToken(ctx context.Context, userID int64, name, plainToken, tokenHash, tokenPrefix string, maxProxyCount int, expiresAt *time.Time) (*AccessToken, error) {
-	res, err := s.db.ExecContext(ctx, `
+	res, err := s.execUserIdentityChange(ctx, userID, `
 		INSERT INTO access_tokens(user_id, name, token_hash, token_prefix, plain_token, status, max_proxy_count, expires_at)
 		VALUES(?, ?, ?, ?, ?, 'active', ?, ?)
 	`, userID, name, tokenHash, tokenPrefix, plainToken, maxProxyCount, expiresAt)
@@ -515,14 +524,22 @@ func (s *Store) ListAccessTokens(ctx context.Context) ([]AccessToken, error) {
 }
 
 func (s *Store) SetAccessTokenStatus(ctx context.Context, id int64, status, reason string) error {
-	_, err := s.db.ExecContext(ctx, `
+	token, err := s.GetAccessTokenByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	_, err = s.execUserIdentityChange(ctx, token.UserID, `
 		UPDATE access_tokens SET status=?, ban_reason=NULLIF(?, ''), updated_at=CURRENT_TIMESTAMP(3) WHERE id=?
 	`, status, reason, id)
 	return err
 }
 
 func (s *Store) RotateAccessToken(ctx context.Context, id int64, plainToken, tokenHash, tokenPrefix string) (*AccessToken, error) {
-	_, err := s.db.ExecContext(ctx, `
+	token, err := s.GetAccessTokenByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	_, err = s.execUserIdentityChange(ctx, token.UserID, `
 		UPDATE access_tokens
 		SET token_hash=?, token_prefix=?, plain_token=?, status='active', ban_reason=NULL, updated_at=CURRENT_TIMESTAMP(3)
 		WHERE id=?
@@ -534,7 +551,11 @@ func (s *Store) RotateAccessToken(ctx context.Context, id int64, plainToken, tok
 }
 
 func (s *Store) CreatePortGrant(ctx context.Context, grant PortGrant) (*PortGrant, error) {
-	res, err := s.db.ExecContext(ctx, `
+	token, err := s.GetAccessTokenByID(ctx, grant.TokenID)
+	if err != nil {
+		return nil, err
+	}
+	res, err := s.execUserIdentityChange(ctx, token.UserID, `
 		INSERT INTO token_port_grants(token_id, protocol, remote_port_start, remote_port_end, max_count, domain, subdomain, enabled)
 		VALUES(?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?)
 	`, grant.TokenID, grant.Protocol, grant.RemotePortStart, grant.RemotePortEnd, grant.MaxCount, grant.Domain, grant.Subdomain, grant.Enabled)
@@ -587,13 +608,18 @@ func (s *Store) ListAllPortGrants(ctx context.Context) ([]PortGrant, error) {
 }
 
 func (s *Store) RemotePortInUse(ctx context.Context, protocol string, remotePort int) (bool, error) {
+	return s.RemotePortInUseExceptClient(ctx, protocol, remotePort, 0, "")
+}
+
+func (s *Store) RemotePortInUseExceptClient(ctx context.Context, protocol string, remotePort int, tokenID int64, clientID string) (bool, error) {
 	var count int
 	err := s.db.QueryRowContext(ctx, `
 		SELECT COUNT(*)
 		FROM lease_proxy_allocations a
 		JOIN runtime_leases l ON l.lease_id=a.lease_id
 		WHERE a.proxy_type=? AND a.remote_port=? AND l.status='active' AND l.expires_at>CURRENT_TIMESTAMP(3)
-	`, protocol, remotePort).Scan(&count)
+		AND NOT (l.token_id=? AND l.client_id=?)
+	`, protocol, remotePort, tokenID, clientID).Scan(&count)
 	return count > 0, err
 }
 

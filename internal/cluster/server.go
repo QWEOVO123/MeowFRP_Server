@@ -6,7 +6,9 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"strings"
@@ -23,24 +25,62 @@ import (
 )
 
 type ControllerServer struct {
-	store             NodeStore
-	paths             PKIPaths
-	material          *PKIMaterial
-	httpServer        *http.Server
-	grpcServer        *grpc.Server
-	actualAddr        string
-	mu                sync.RWMutex
-	sessions          map[string]*nodeSession
-	commandWaiters    map[string]chan CommandResult
-	heartbeatInterval int
+	forgottenNodes        map[string]bool
+	nodeCatalog           map[string]db.EdgeNode
+	databaseFault         bool
+	databaseSuspect       bool
+	store                 NodeStore
+	paths                 PKIPaths
+	material              *PKIMaterial
+	httpServer            *http.Server
+	grpcServer            *grpc.Server
+	actualAddr            string
+	mu                    sync.RWMutex
+	syncMu                sync.Mutex
+	sessions              map[string]*nodeSession
+	commandWaiters        map[string]chan CommandResult
+	heartbeatInterval     int
+	identityChanges       chan struct{}
+	handshakeTimeout      time.Duration
+	disableSessionTickets bool
 }
 
 type nodeSession struct {
-	nodeID        string
-	send          chan Message
-	connectedAt   time.Time
-	lastHeartbeat time.Time
-	capabilities  json.RawMessage
+	admissionProtocol int
+	blockedIPs        map[string]db.BlockedInboundIP
+	cancel            context.CancelFunc
+	nodeID            string
+	send              chan Message
+	connectedAt       time.Time
+	lastHeartbeat     time.Time
+	capabilities      json.RawMessage
+	pendingRevision   int64
+	appliedRevision   int64
+	syncStarted       time.Time
+	done              <-chan struct{}
+	cacheSessionID    string
+	bootID            string
+	cacheProtocol     int
+	needsFull         bool
+	needsBlockedIPs   bool
+	pendingIdentity   *IdentitySnapshot
+	cacheReady        bool
+	baselineActive    bool
+	baselineCursor    int64
+	pendingCursor     int64
+	pendingPayload    []byte
+	chunkIndex        int
+	chunkTotal        int
+	applyProgress     int64
+}
+
+type IdentityCacheStore interface {
+	NextIdentityRevision(context.Context) (int64, error)
+	ResetNodeIdentityCache(context.Context, string, string, string) error
+	MarkUserIdentityDirty(context.Context, int64) error
+	PendingNodeIdentityUsers(context.Context, string, string) ([]int64, error)
+	PrepareNodeIdentityCache(context.Context, string, string, int64, []int64) error
+	ConfirmNodeIdentityCache(context.Context, string, string, int64, []int64, []int64, bool) error
 }
 
 type NodeStore interface {
@@ -74,12 +114,18 @@ type NodeTelemetryStore interface {
 }
 
 func NewControllerServer(store NodeStore, paths PKIPaths) *ControllerServer {
-	return &ControllerServer{store: store, paths: paths, sessions: map[string]*nodeSession{}, commandWaiters: map[string]chan CommandResult{}, heartbeatInterval: 5}
+	return &ControllerServer{store: store, paths: paths, sessions: map[string]*nodeSession{}, commandWaiters: map[string]chan CommandResult{}, heartbeatInterval: 5, identityChanges: make(chan struct{}, 1)}
 }
 func NewControllerServerWithMaterial(store NodeStore, material PKIMaterial) *ControllerServer {
-	return &ControllerServer{store: store, material: &material, sessions: map[string]*nodeSession{}, commandWaiters: map[string]chan CommandResult{}, heartbeatInterval: 5}
+	return &ControllerServer{store: store, material: &material, sessions: map[string]*nodeSession{}, commandWaiters: map[string]chan CommandResult{}, heartbeatInterval: 5, identityChanges: make(chan struct{}, 1)}
 }
 func (s *ControllerServer) Addr() string { return s.actualAddr }
+
+// ConfigureTransport is only called before Start; changes require restart.
+func (s *ControllerServer) ConfigureTransport(handshakeTimeout time.Duration, disableSessionTickets bool) {
+	s.handshakeTimeout = handshakeTimeout
+	s.disableSessionTickets = disableSessionTickets
+}
 func (s *ControllerServer) SetHeartbeatInterval(seconds int) {
 	if seconds < 2 {
 		seconds = 2
@@ -103,16 +149,31 @@ func (s *ControllerServer) ConnectedNodes() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]string, 0, len(s.sessions))
-	for id := range s.sessions {
-		out = append(out, id)
+	now := time.Now()
+	for id, session := range s.sessions {
+		if s.sessionAliveLocked(session, now) {
+			out = append(out, id)
+		}
 	}
 	return out
 }
+func (s *ControllerServer) DisconnectNode(nodeID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if session := s.sessions[nodeID]; session != nil {
+		if session.cancel != nil {
+			session.cancel()
+		}
+		delete(s.sessions, nodeID)
+	}
+}
+
 func (s *ControllerServer) SendCommand(command NodeCommand) bool {
 	s.mu.RLock()
 	session := s.sessions[command.NodeID]
+	alive := s.sessionAliveLocked(session, time.Now())
 	s.mu.RUnlock()
-	if session == nil {
+	if !alive {
 		return false
 	}
 	payload, _ := json.Marshal(command)
@@ -120,16 +181,20 @@ func (s *ControllerServer) SendCommand(command NodeCommand) bool {
 	case session.send <- Message{Type: "command", NodeID: command.NodeID, CommandID: command.CommandID, Payload: payload, SentAt: time.Now()}:
 		return true
 	default:
+		if session.cancel != nil {
+			session.cancel()
+		}
 		return false
 	}
 }
 
-// SendCommandAndWait delivers a sensitive online-only command without storing
-// its payload in the command database. The caller owns the timeout policy.
+// SendCommandAndWait awaits the online edge's reply. It does not persist any
+// payload itself: ordinary commands are queued by callers, while sensitive
+// commands remain memory-only. The caller owns the timeout policy.
 func (s *ControllerServer) SendCommandAndWait(ctx context.Context, command NodeCommand) (CommandResult, error) {
 	waiter := make(chan CommandResult, 1)
 	s.mu.Lock()
-	if s.sessions[command.NodeID] == nil {
+	if !s.sessionAliveLocked(s.sessions[command.NodeID], time.Now()) {
 		s.mu.Unlock()
 		return CommandResult{}, errors.New("edge node is offline")
 	}
@@ -159,10 +224,27 @@ func (s *ControllerServer) NodeSession(nodeID string) (bool, json.RawMessage) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	session := s.sessions[nodeID]
-	if session == nil {
+	if !s.sessionAliveLocked(session, time.Now()) {
 		return false, nil
 	}
 	return true, append(json.RawMessage(nil), session.capabilities...)
+}
+
+func (s *ControllerServer) sessionAliveLocked(session *nodeSession, now time.Time) bool {
+	if session == nil || session.lastHeartbeat.IsZero() {
+		return false
+	}
+	select {
+	case <-session.done:
+		return false
+	default:
+	}
+	interval := s.heartbeatInterval
+	if interval == 0 {
+		interval = 5
+	}
+	timeout := heartbeatTimeout(int64(interval))
+	return now.Sub(session.lastHeartbeat) <= timeout
 }
 
 func (s *ControllerServer) deliverCommandResult(result CommandResult) bool {
@@ -180,6 +262,20 @@ func (s *ControllerServer) deliverCommandResult(result CommandResult) bool {
 }
 
 func (s *ControllerServer) Start(ctx context.Context, addr string) error {
+	if catalog, ok := s.store.(interface {
+		ListEdgeNodes(context.Context) ([]db.EdgeNode, error)
+	}); ok {
+		readCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		nodes, err := catalog.ListEdgeNodes(readCtx)
+		cancel()
+		if err != nil {
+			log.Printf("load controller node catalog: %v", err)
+			s.SetDatabaseSuspect(true)
+			s.SetDatabaseFault(true)
+		} else {
+			s.ReplaceNodeCatalog(nodes)
+		}
+	}
 	material, err := s.pkiMaterial()
 	if err != nil {
 		return err
@@ -193,7 +289,8 @@ func (s *ControllerServer) Start(ctx context.Context, addr string) error {
 		return errors.New("invalid node CA")
 	}
 	tlsCfg := &tls.Config{Certificates: []tls.Certificate{cert}, ClientCAs: pool, ClientAuth: tls.RequireAndVerifyClientCert, MinVersion: tls.VersionTLS12, NextProtos: []string{"h2"}}
-	s.grpcServer = grpc.NewServer(grpc.Creds(credentials.NewTLS(tlsCfg)), grpc.ForceServerCodec(jsonCodec{}))
+	tlsCfg.SessionTicketsDisabled = s.disableSessionTickets
+	s.grpcServer = grpc.NewServer(grpc.Creds(credentials.NewTLS(tlsCfg)), grpc.ForceServerCodec(jsonCodec{}), grpc.MaxRecvMsgSize(maxControlMessageBytes), grpc.MaxSendMsgSize(maxControlMessageBytes))
 	s.grpcServer.RegisterService(&controlServiceDesc, s)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -203,13 +300,18 @@ func (s *ControllerServer) Start(ctx context.Context, addr string) error {
 		}
 		http.NotFound(w, r)
 	})
-	s.httpServer = &http.Server{Addr: addr, Handler: mux, TLSConfig: tlsCfg, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
+	handshakeTimeout := s.handshakeTimeout
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = 10 * time.Second
+	}
+	s.httpServer = &http.Server{Addr: addr, Handler: mux, TLSConfig: tlsCfg, ReadHeaderTimeout: handshakeTimeout, IdleTimeout: 2 * time.Minute}
 	_ = http2.ConfigureServer(s.httpServer, &http2.Server{})
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 	s.actualAddr = listener.Addr().String()
+	go s.runIdentityPushes(ctx)
 	tlsListener := tls.NewListener(listener, tlsCfg)
 	go func() {
 		<-ctx.Done()
@@ -289,12 +391,17 @@ func (s *ControllerServer) Connect(stream grpc.ServerStream) error {
 	}
 	cert := tlsInfo.State.PeerCertificates[0]
 	nodeID := cert.Subject.CommonName
-	node, err := s.store.GetEdgeNode(stream.Context(), nodeID)
+	node, err := s.authorizedNode(stream.Context(), nodeID)
 	if err != nil || node.Status != "active" || !strings.EqualFold(node.CertificateSerial, cert.SerialNumber.Text(16)) {
 		return errors.New("edge node is not authorized")
 	}
-	session := &nodeSession{nodeID: nodeID, send: make(chan Message, 128), connectedAt: time.Now(), lastHeartbeat: time.Now()}
+	sessionCtx, cancelSession := context.WithCancel(stream.Context())
+	defer cancelSession()
+	session := &nodeSession{nodeID: nodeID, send: make(chan Message, 128), connectedAt: time.Now(), lastHeartbeat: time.Now(), cancel: cancelSession, done: sessionCtx.Done()}
 	s.mu.Lock()
+	if previous := s.sessions[nodeID]; previous != nil && previous.cancel != nil {
+		previous.cancel()
+	}
 	s.sessions[nodeID] = session
 	s.mu.Unlock()
 	defer func() {
@@ -304,16 +411,27 @@ func (s *ControllerServer) Connect(stream grpc.ServerStream) error {
 		}
 		s.mu.Unlock()
 	}()
+	// Recheck after registration to close the race with an administrator deleting
+	// the node between the initial lookup and the session being registered.
+	node, err = s.authorizedNode(sessionCtx, nodeID)
+	if err != nil || node.Status != "active" || !strings.EqualFold(node.CertificateSerial, cert.SerialNumber.Text(16)) {
+		return errors.New("edge node is not authorized")
+	}
 	writeErr := make(chan error, 1)
 	go func() {
 		for {
 			select {
 			case message := <-session.send:
+				if message.Type == "identity_chunk" || message.Type == "identity_snapshot" {
+					s.mu.Lock()
+					session.syncStarted = time.Now() // Starts on transmission, not queueing.
+					s.mu.Unlock()
+				}
 				if err := stream.SendMsg(&message); err != nil {
 					writeErr <- err
 					return
 				}
-			case <-stream.Context().Done():
+			case <-sessionCtx.Done():
 				return
 			}
 		}
@@ -324,115 +442,245 @@ func (s *ControllerServer) Connect(stream grpc.ServerStream) error {
 			return nil
 		case err := <-writeErr:
 			return err
-		case <-stream.Context().Done():
-			return stream.Context().Err()
+		case <-sessionCtx.Done():
+			return sessionCtx.Err()
 		}
 	}
-	observedAddress := peerHost(peerInfo.Addr)
-	welcomePayload, _ := json.Marshal(HeartbeatAck{IntervalSeconds: s.HeartbeatInterval(), ServerTime: time.Now(), ObservedAddress: observedAddress})
-	if err := enqueue(Message{Type: "welcome", NodeID: nodeID, Payload: welcomePayload, SentAt: time.Now()}); err != nil {
+	type receiveResult struct {
+		message Message
+		err     error
+	}
+	received := make(chan receiveResult)
+	go func() {
+		for {
+			var message Message
+			err := stream.RecvMsg(&message)
+			select {
+			case received <- receiveResult{message, err}:
+			case <-sessionCtx.Done():
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	// The edge first reports its process boot epoch. Cached identities are never
+	// assumed to survive a restart; reconnect also requires a fresh full ACK.
+	helloTimer := time.NewTimer(10 * time.Second)
+	defer helloTimer.Stop()
+	select {
+	case first := <-received:
+		if first.err != nil {
+			return first.err
+		}
+		if first.message.Type != "hello" || first.message.NodeID != nodeID {
+			return errors.New("edge hello identity mismatch")
+		}
+		if len(first.message.BootID) > 128 {
+			return errors.New("invalid edge boot epoch")
+		}
+		session.bootID = first.message.BootID
+		session.cacheProtocol = first.message.CacheProtocol
+		session.admissionProtocol = first.message.AdmissionProtocol
+		if session.cacheProtocol >= 2 && session.bootID == "" {
+			return errors.New("edge boot epoch is required")
+		}
+		s.mu.Lock()
+		session.capabilities = first.message.Capabilities
+		s.mu.Unlock()
+	case <-helloTimer.C:
+		return errors.New("edge startup hello timed out")
+	case <-sessionCtx.Done():
+		return sessionCtx.Err()
+	}
+	cacheSessionID, _, err := security.NewOpaqueToken("cache_")
+	if err != nil {
 		return err
 	}
-	if snapshot, err := s.identitySnapshotMessage(stream.Context(), nodeID); err == nil && snapshot != nil {
-		if err := enqueue(*snapshot); err != nil {
+	s.mu.Lock()
+	session.cacheSessionID = cacheSessionID
+	s.mu.Unlock()
+	observedAddress := peerHost(peerInfo.Addr)
+	protocol := 2
+	if session.cacheProtocol >= 3 {
+		protocol = 3
+	}
+	welcomePayload, _ := json.Marshal(HeartbeatAck{ControllerFault: s.DatabaseFault(), IdentityProtocol: protocol, IntervalSeconds: s.HeartbeatInterval(), ServerTime: time.Now(), ObservedAddress: observedAddress})
+	if err := enqueue(Message{Type: "welcome", NodeID: nodeID, CacheSessionID: cacheSessionID, Payload: welcomePayload, SentAt: time.Now()}); err != nil {
+		return err
+	}
+	if session.cacheProtocol < 3 {
+		err = func() error {
+			s.syncMu.Lock()
+			defer s.syncMu.Unlock()
+			if cache, ok := s.store.(IdentityCacheStore); ok {
+				if err := cache.ResetNodeIdentityCache(sessionCtx, nodeID, cacheSessionID, session.bootID); err != nil {
+					return err
+				}
+			}
+			s.mu.Lock()
+			session.cacheReady = true
+			s.mu.Unlock()
+			log.Printf("edge started/reconnected node=%s boot=%s cache associations reset; full synchronization required", nodeID, session.bootID)
+			snapshot, err := s.identitySnapshotMessage(stream.Context(), nodeID)
+			if err != nil {
+				return fmt.Errorf("build initial identity snapshot: %w", err)
+			}
+			if snapshot != nil {
+				if err := s.enqueueIdentity(sessionCtx, session, snapshot); err != nil {
+					return err
+				}
+			}
+			return nil
+		}()
+		if err != nil {
 			return err
 		}
+	} else {
+		s.mu.Lock()
+		session.syncStarted = time.Now()
+		s.mu.Unlock()
+		log.Printf("edge node=%s boot=%s waiting for cache-cleared acknowledgement session=%s", nodeID, session.bootID, cacheSessionID)
 	}
 	s.dispatchPendingCommands(stream.Context(), nodeID)
 	lastPersist := time.Time{}
+	telemetryJobs := make(chan Message, 16)
+	touchJobs := make(chan string, 1)
+	go func() {
+		for {
+			select {
+			case <-sessionCtx.Done():
+				return
+			case message := <-telemetryJobs:
+				ctx, cancel := context.WithTimeout(sessionCtx, 3*time.Second)
+				s.persistControlData(ctx, session, message)
+				cancel()
+			case capabilities := <-touchJobs:
+				ctx, cancel := context.WithTimeout(sessionCtx, time.Second)
+				err := s.store.TouchEdgeNode(ctx, nodeID, peerInfo.Addr.String(), capabilities)
+				cancel()
+				if err != nil {
+					log.Printf("persist edge heartbeat node=%s: %v", nodeID, err)
+				}
+			}
+		}
+	}()
+	// MySQL reset/ACK transactions must not block control heartbeat replies.
+	identityJobs := make(chan Message, 128)
+	identityErr := make(chan error, 1)
+	go func() {
+		for {
+			select {
+			case <-sessionCtx.Done():
+				return
+			case job := <-identityJobs:
+				var err error
+				for {
+					jobCtx, jobCancel := context.WithTimeout(sessionCtx, 20*time.Second)
+					if job.Type == "cache_cleared" {
+						err = s.acceptCacheCleared(jobCtx, session, job)
+					} else {
+						err = s.confirmIdentity(jobCtx, session, job)
+					}
+					jobCancel()
+					var storageErr identityStorageError
+					if !errors.As(err, &storageErr) {
+						break
+					}
+					log.Printf("edge identity SQL retry node=%s type=%s: %v", nodeID, job.Type, err)
+					select {
+					case <-sessionCtx.Done():
+						return
+					case <-time.After(time.Second):
+					}
+				}
+				if err != nil {
+					select {
+					case identityErr <- err:
+					case <-sessionCtx.Done():
+					}
+					return
+				}
+			}
+		}
+	}()
+	watchdog := time.NewTicker(time.Second)
+	defer watchdog.Stop()
 	for {
 		var message Message
-		if err := stream.RecvMsg(&message); err != nil {
+		select {
+		case <-sessionCtx.Done():
+			return sessionCtx.Err()
+		case err := <-writeErr:
 			return err
+		case err := <-identityErr:
+			return err
+		case <-watchdog.C:
+			s.mu.RLock()
+			alive := s.sessionAliveLocked(session, time.Now())
+			syncOverdue := (!session.cacheReady || session.pendingRevision > session.appliedRevision) && time.Since(session.syncStarted) > identityIdleTimeout
+			s.mu.RUnlock()
+			if !alive {
+				return errors.New("edge heartbeat timed out")
+			}
+			if syncOverdue && !s.DatabaseUnavailable() {
+				return errors.New("edge configuration acknowledgement timed out")
+			}
+			continue
+		case result := <-received:
+			if result.err != nil {
+				return result.err
+			}
+			message = result.message
 		}
-		capabilities := string(message.Capabilities)
-		if capabilities == "" {
-			capabilities = "{}"
+		if sessionCtx.Err() != nil {
+			return sessionCtx.Err()
+		}
+		if message.NodeID != nodeID {
+			return errors.New("message node identity does not match mTLS certificate")
 		}
 		now := time.Now()
 		s.mu.Lock()
 		if s.sessions[nodeID] == session {
 			session.lastHeartbeat = now
-			session.capabilities = append(session.capabilities[:0], message.Capabilities...)
+			if len(message.Capabilities) > 0 {
+				session.capabilities = append(session.capabilities[:0], message.Capabilities...)
+			}
+		}
+		capabilities := string(session.capabilities)
+		if capabilities == "" {
+			capabilities = "{}"
 		}
 		s.mu.Unlock()
-		if lastPersist.IsZero() || now.Sub(lastPersist) >= 30*time.Second {
-			if err := s.store.TouchEdgeNode(stream.Context(), nodeID, peerInfo.Addr.String(), capabilities); err != nil {
+		if message.Type == "identity_chunk_ack" || message.Type == "identity_progress" {
+			if err := s.acceptIdentityProgress(session, message); err != nil {
 				return err
+			}
+		} else if message.Type == "cache_cleared" || message.Type == "identity_ack" {
+			select {
+			case identityJobs <- message:
+			default:
+				log.Printf("edge node=%s redundant identity acknowledgement queue full; awaiting retry", nodeID)
+			}
+		}
+		if len(message.Capabilities) > 0 || lastPersist.IsZero() || now.Sub(lastPersist) >= 30*time.Second {
+			select {
+			case touchJobs <- capabilities:
+			default:
 			}
 			lastPersist = now
 		}
 		if message.Type == "heartbeat" {
-			var heartbeat HeartbeatPayload
-			_ = json.Unmarshal(message.Payload, &heartbeat)
-			if control, ok := s.store.(NodeControlStore); ok {
-				clients := make([]db.EdgeClientPresence, 0, len(heartbeat.Clients))
-				for _, client := range heartbeat.Clients {
-					seen := now
-					if client.LastSeenAt != nil {
-						seen = *client.LastSeenAt
-					}
-					clients = append(clients, db.EdgeClientPresence{NodeID: nodeID, UserID: client.UserID, TokenID: client.TokenID, ClientID: client.ClientID, FRPCRunning: client.FRPCRunning, LastSeenAt: seen})
-				}
-				_ = control.ReplaceEdgeClientPresence(stream.Context(), nodeID, clients)
-			}
-			if telemetry, ok := s.store.(NodeTelemetryStore); ok {
-				if heartbeat.ReportingVersion > 0 {
-					connections := make([]db.EdgeConnectionPresence, 0, len(heartbeat.Connections))
-					if heartbeat.ConnectionsReportingEnabled {
-						for _, connection := range heartbeat.Connections {
-							connections = append(connections, db.EdgeConnectionPresence{
-								NodeID: nodeID, ConnectionID: connection.ID, Protocol: connection.Protocol,
-								UserID: connection.UserID, TokenID: connection.TokenID, ClientID: connection.ClientID,
-								ClientAddr: connection.ClientAddr, LeaseID: connection.LeaseID, ProxyName: connection.ProxyName,
-								ProxyType: connection.ProxyType, RemotePort: connection.RemotePort, InboundAddr: connection.InboundAddr,
-								InboundIP: connection.InboundIP, InboundPort: connection.InboundPort, ServerAddr: connection.ServerAddr,
-								OpenedAt: connection.OpenedAt, LastSeenAt: connection.LastSeenAt, CanTerminate: connection.CanTerminate,
-							})
-						}
-					}
-					_ = telemetry.ReplaceEdgeConnectionPresence(stream.Context(), nodeID, connections)
-				}
-				if heartbeat.Traffic != nil {
-					traffic := heartbeat.Traffic
-					_ = telemetry.UpsertEdgeNodeTraffic(stream.Context(), db.EdgeNodeTraffic{
-						NodeID: nodeID, BytesInbound: traffic.BytesInbound, BytesOutbound: traffic.BytesOutbound,
-						SamplesInbound: traffic.SamplesInbound, SamplesOutbound: traffic.SamplesOutbound,
-						StartedAt: traffic.StartedAt, CapturedAt: traffic.CapturedAt,
-					})
-				}
-			}
-			ackPayload, _ := json.Marshal(HeartbeatAck{IntervalSeconds: s.HeartbeatInterval(), ServerTime: now, ObservedAddress: observedAddress})
+			ackPayload, _ := json.Marshal(HeartbeatAck{ControllerFault: s.DatabaseFault(), IntervalSeconds: s.HeartbeatInterval(), ServerTime: now, ObservedAddress: observedAddress})
 			if err := enqueue(Message{Type: "heartbeat_ack", NodeID: nodeID, Sequence: message.Sequence, Payload: ackPayload, SentAt: now}); err != nil {
 				return err
 			}
-			if message.Sequence%12 == 0 {
-				if snapshot, err := s.identitySnapshotMessage(stream.Context(), nodeID); err == nil && snapshot != nil {
-					if err := enqueue(*snapshot); err != nil {
-						return err
-					}
-				}
-			}
-			s.dispatchPendingCommands(stream.Context(), nodeID)
-		} else if message.Type == "event_batch" {
-			var batch EventBatch
-			if json.Unmarshal(message.Payload, &batch) == nil {
-				acked := s.recordEventBatch(stream.Context(), nodeID, message.Sequence, batch)
-				payload, _ := json.Marshal(EventAck{EventIDs: acked})
-				if err := enqueue(Message{Type: "event_ack", NodeID: nodeID, Sequence: message.Sequence, Payload: payload, SentAt: now}); err != nil {
-					return err
-				}
-			}
-		} else if message.Type == "command_result" {
-			var result CommandResult
-			if json.Unmarshal(message.Payload, &result) == nil {
-				if s.deliverCommandResult(result) {
-					continue
-				}
-				if control, ok := s.store.(NodeControlStore); ok {
-					encoded, _ := json.Marshal(result)
-					_ = control.CompleteNodeCommand(stream.Context(), nodeID, result.CommandID, result.Status, string(encoded))
-				}
+		} else if message.Type == "report" || message.Type == "event_batch" || message.Type == "command_result" {
+			select {
+			case telemetryJobs <- message:
+			default:
+				s.deliverCommandResult(CommandResult{CommandID: message.CommandID, Status: "failed", Error: "persistence queue is busy; retry later"})
 			}
 		}
 	}
@@ -450,6 +698,10 @@ func peerHost(addr net.Addr) string {
 }
 
 func (s *ControllerServer) identitySnapshotMessage(ctx context.Context, nodeID string) (*Message, error) {
+	return s.identitySnapshotForUsers(ctx, nodeID, nil)
+}
+
+func (s *ControllerServer) identitySnapshotForUsers(ctx context.Context, nodeID string, requested []int64) (*Message, error) {
 	if _, ok := s.store.(IdentitySnapshotStore); !ok {
 		return nil, nil
 	}
@@ -478,12 +730,82 @@ func (s *ControllerServer) identitySnapshotMessage(ctx context.Context, nodeID s
 	if err != nil {
 		return nil, err
 	}
-	snapshot := IdentitySnapshot{Revision: time.Now().UnixNano(), Policies: policies, Grants: grants, DPIPolicies: dpiPolicies, BlockedIPs: blocked}
+	revision := time.Now().UnixNano()
+	if cache, ok := s.store.(IdentityCacheStore); ok {
+		revision, err = cache.NextIdentityRevision(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	snapshot := IdentitySnapshot{Revision: revision, Incremental: requested != nil}
+	requestedSet := map[int64]bool{}
+	for _, id := range requested {
+		requestedSet[id] = true
+	}
+	keptUsers := map[int64]bool{}
+	accessStore, ok := s.store.(interface {
+		CanAccessNode(context.Context, int64, string) (bool, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("node access store unavailable")
+	}
+	snapshot.NodeAccessEnforced = true
+	var allowedUsers map[int64]bool
+	if nodeAccess, ok := s.store.(interface {
+		ListNodeUserAccess(context.Context, string) (map[int64]bool, error)
+	}); ok {
+		allowedUsers, err = nodeAccess.ListNodeUserAccess(ctx, nodeID)
+		if err != nil {
+			return nil, err
+		}
+	}
 	for _, user := range users {
+		if requested != nil && !requestedSet[user.ID] {
+			continue
+		}
+		allowed := allowedUsers[user.ID]
+		if allowedUsers == nil {
+			allowed, err = accessStore.CanAccessNode(ctx, user.ID, nodeID)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if !allowed {
+			continue
+		}
+		keptUsers[user.ID] = true
 		snapshot.Users = append(snapshot.Users, SnapshotUser{user.ID, user.Username, user.Role, user.Status, user.BanReason})
 	}
+	for _, id := range requested {
+		if !keptUsers[id] {
+			snapshot.RemovedUserIDs = append(snapshot.RemovedUserIDs, id)
+		}
+	}
+	keptTokens := map[int64]bool{}
 	for _, token := range tokens {
+		if !keptUsers[token.UserID] {
+			continue
+		}
+		keptTokens[token.ID] = true
 		snapshot.Tokens = append(snapshot.Tokens, SnapshotToken{token.ID, token.UserID, token.Name, token.TokenHash, token.Status, token.BanReason, token.MaxProxyCount, token.ExpiresAt})
+	}
+	for _, policy := range policies {
+		if keptUsers[policy.UserID] {
+			snapshot.Policies = append(snapshot.Policies, policy)
+		}
+	}
+	for _, grant := range grants {
+		if keptTokens[grant.TokenID] {
+			snapshot.Grants = append(snapshot.Grants, grant)
+		}
+	}
+	for _, policy := range dpiPolicies {
+		if keptUsers[policy.UserID] {
+			snapshot.DPIPolicies = append(snapshot.DPIPolicies, policy)
+		}
+	}
+	if !snapshot.Incremental {
+		snapshot.BlockedIPs = blocked
 	}
 	payload, err := json.Marshal(snapshot)
 	if err != nil {
@@ -493,6 +815,11 @@ func (s *ControllerServer) identitySnapshotMessage(ctx context.Context, nodeID s
 }
 
 func (s *ControllerServer) dispatchPendingCommands(ctx context.Context, nodeID string) {
+	if s.DatabaseUnavailable() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
 	control, ok := s.store.(NodeControlStore)
 	if !ok {
 		return
@@ -509,6 +836,9 @@ func (s *ControllerServer) dispatchPendingCommands(ctx context.Context, nodeID s
 	}
 }
 func (s *ControllerServer) recordEventBatch(ctx context.Context, nodeID string, sequence int64, batch EventBatch) []string {
+	if sequence < 0 || sequence > (math.MaxInt64-999)/1000 || len(batch.Events) > 100 {
+		return nil
+	}
 	control, ok := s.store.(NodeControlStore)
 	if !ok {
 		return nil
@@ -516,6 +846,16 @@ func (s *ControllerServer) recordEventBatch(ctx context.Context, nodeID string, 
 	acked := make([]string, 0, len(batch.Events))
 	for index, event := range batch.Events {
 		if event.EventID == "" {
+			continue
+		}
+		if durable, ok := s.store.(interface {
+			RecordNodeEventDurably(context.Context, string, int64, string, string, string) error
+		}); ok {
+			if err := durable.RecordNodeEventDurably(ctx, nodeID, sequence*1000+int64(index), event.EventID, event.EventType, string(event.Payload)); err != nil {
+				log.Printf("store edge event %s on %s: %v", event.EventID, nodeID, err)
+				continue
+			}
+			acked = append(acked, event.EventID)
 			continue
 		}
 		inserted, err := control.RecordNodeEvent(ctx, nodeID, sequence*1000+int64(index), event.EventID, event.EventType, string(event.Payload))

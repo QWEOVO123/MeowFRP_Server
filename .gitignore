@@ -6,6 +6,7 @@ frp-control-server.cfg.json
 
 # Build and release output
 /bin/
+/build/
 /dist/
 *.exe
 *.dll

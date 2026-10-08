@@ -65,6 +65,7 @@ func (s *Server) blockInboundIP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "ip is invalid")
 		return
 	}
+	req.IP = net.ParseIP(req.IP).String()
 	var adminID int64
 	if admin := currentUser(r); admin != nil {
 		adminID = admin.ID
@@ -92,6 +93,7 @@ func (s *Server) unblockInboundIP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "ip is invalid")
 		return
 	}
+	ip = net.ParseIP(ip).String()
 	if store := s.getStore(); store != nil {
 		if err := store.DeleteBlockedInboundIP(r.Context(), ip); err != nil {
 			writeError(w, http.StatusInternalServerError, "delete blocked ip failed: "+err.Error())

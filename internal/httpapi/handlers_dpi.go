@@ -89,9 +89,6 @@ func (s *Server) updateUserDPIPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	detectors := normalizeDPIDetectors(req.EnabledDetectors)
-	if len(detectors) == 0 {
-		detectors = dpi.DefaultPolicy().EnabledDetectors
-	}
 	policy, err := s.store.UpsertDPIPolicy(r.Context(), dpi.Policy{
 		UserID:               userID,
 		Enabled:              req.Enabled,
@@ -116,11 +113,14 @@ func (s *Server) updateUserDPIPolicy(w http.ResponseWriter, r *http.Request) {
 }
 
 func normalizeDPIDetectors(values []string) []string {
+	if values == nil {
+		return dpi.DefaultPolicy().EnabledDetectors
+	}
 	allowed := map[string]bool{
 		"http": true, "tls": true, "quic": true, "encrypted_tunnel": true,
 	}
 	seen := map[string]bool{}
-	var out []string
+	out := make([]string, 0, len(values))
 	for _, value := range values {
 		value = strings.ToLower(strings.TrimSpace(value))
 		if allowed[value] && !seen[value] {

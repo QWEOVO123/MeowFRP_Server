@@ -3,8 +3,11 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 func TestDefaultsUsePublicAPIAndTwentyFourHourRuntimeLease(t *testing.T) {
@@ -16,6 +19,60 @@ func TestDefaultsUsePublicAPIAndTwentyFourHourRuntimeLease(t *testing.T) {
 	}
 	if cfg.RuntimeTokenTTL != 24*time.Hour {
 		t.Fatalf("expected 24 hour runtime lease, got %s", cfg.RuntimeTokenTTL)
+	}
+}
+
+func TestUnconfiguredLoadKeepsEmbeddedFRPEnabled(t *testing.T) {
+	t.Setenv("FRP_CONTROL_CONFIG", filepath.Join(t.TempDir(), "new-server.json"))
+	t.Setenv("FRP_CONTROL_EMBEDDED_FRPS_ENABLED", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ConfigState != "unconfigured" || !cfg.EmbeddedFRPEnabled {
+		t.Fatalf("new installation must retain the enabled FRP preference: state=%s enabled=%t", cfg.ConfigState, cfg.EmbeddedFRPEnabled)
+	}
+	if file := cfg.FileConfig(); file.EmbeddedFRPEnabled == nil || !*file.EmbeddedFRPEnabled {
+		t.Fatal("the preference saved after setup must remain enabled")
+	}
+}
+
+func TestLoadPreservesExplicitEmbeddedFRPDisable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "server.json")
+	t.Setenv("FRP_CONTROL_CONFIG", path)
+	t.Setenv("FRP_CONTROL_EMBEDDED_FRPS_ENABLED", "")
+	cfg := defaults()
+	cfg.ConfigurationMode = ConfigurationManual
+	cfg.Mode = ModeController
+	cfg.Initialized = true
+	cfg.MySQLDSN = "dsn"
+	cfg.InitialAdmin = InitialAdminConfig{Username: "admin", PasswordHash: "hash"}
+	cfg.EmbeddedFRPEnabled = false
+	if err := WriteFileConfig(path, cfg.FileConfig()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ConfigState != "configured" || loaded.EmbeddedFRPEnabled {
+		t.Fatal("upgrades must not override an existing explicit disable")
+	}
+}
+
+func TestDSNFromDatabaseSetupEscapesCredentialsAndSupportsIPv6(t *testing.T) {
+	dsn := DSNFromDatabaseSetup(DatabaseSetup{
+		Host: "2001:db8::8", Port: 3307, Username: "user@tenant", Password: "p@ss:w/rd?&", Database: "frp/control",
+	})
+	parsed, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.User != "user@tenant" || parsed.Passwd != "p@ss:w/rd?&" || parsed.Addr != "[2001:db8::8]:3307" || parsed.DBName != "frp/control" {
+		t.Fatalf("DSN fields did not round trip: %#v", parsed)
+	}
+	if !parsed.ParseTime || !parsed.MultiStatements || !strings.Contains(dsn, "charset=utf8mb4,utf8") {
+		t.Fatalf("DSN options were lost: %#v", parsed)
 	}
 }
 
