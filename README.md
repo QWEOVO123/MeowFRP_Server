@@ -1,88 +1,109 @@
 # MeowFRP Server
 
-[中文说明](./README_CN.md)
+[中文说明](./README_CN.md) · [Windows client](https://github.com/QWEOVO123/MeowFRP_Client)
 
-MeowFRP Server is a self-contained FRP control platform that combines an embedded `frps` runtime, a Go control API, a MySQL-backed policy layer, an integrated DPI engine, and a Vue web administration panel.
+MeowFRP is a self-hosted control system around FRP. You manage users, nodes and resource limits in a web panel; users choose an authorized node in the desktop client and start their tunnels. The server handles configuration generation, authorization and runtime control.
 
-Companion client project: [`MeowFRP_Client`](https://github.com/QWEOVO123/MeowFRP_Client)
+Start with one server. When you need more locations, deploy the same binary as edge nodes. The controller owns accounts and policies, while the selected node carries tunnel traffic. Edge traffic does not have to pass through the controller.
 
-## Features
+The adapted `frps` runtime is embedded in the Go application. The Vue panel is **not** embedded: deploy its static build with Nginx or another web server.
 
-- Embedded and policy-aware `frps`; no separate FRP server process is required
-- First-run administrator and MySQL setup through the web panel
-- Administrator sessions derived from a fixed admin token with configurable expiration
-- Automatic HTTPS API token creation for regular users
-- Per-user remote-port ranges, tunnel limits, and protocol permissions
-- Server-generated client configurations with 24-hour FRP runtime leases that are revoked early on logout or heartbeat timeout
-- Immediate enforcement when a user, token, client device, or inbound IP is banned
-- Connected-client presence tracked by ten-second HTTPS heartbeats
-- Remote client commands for stopping FRP, displaying a warning, and forcing reauthentication, with HTTPS acknowledgements and retry
-- Active TCP/UDP connection inventory, TCP termination, and inbound-IP blocking
-- Configurable UDP pseudo-connection timeout
-- Historical client records with explicit deletion
-- Static Vue 3 administration panel designed for Nginx deployment
+## What is included
 
-## Integrated DPI
+- Generated user tokens; per-user node, port, protocol and tunnel limits.
+- Temporary FRP leases tied to allocated proxies.
+- Controller/edge administration, client history, live connections and inbound-IP blocking.
+- Active user, token, resource and DPI synchronization over bidirectional mTLS.
+- On-demand edge telemetry through the panel's “Pull data” action.
+- Remote client commands and separately authorized edge administration.
+- Fault admission gates and proxy draining for control-plane failures.
+- A blue web panel with separate page URLs, per-node settings and a dedicated advanced page.
 
-DPI is fully connected to the embedded FRP data path. It is not a placeholder interface.
+The project is actively evolving. This README describes implemented behavior, not guaranteed compatibility with every older FRP release or network environment.
 
-The current composite engine inspects bounded samples from each flow and supports:
+## Four paths, different responsibilities
 
-- HTTP request detection and `Host` extraction
-- TLS ClientHello detection and SNI extraction
-- QUIC Initial packet detection
-- Heuristic detection of encrypted tunnel traffic, including SS-like traffic patterns
+| Path | Default port | Purpose |
+| --- | --- | --- |
+| Browser/client → HTTPS API | Public 443; backend 8080 | Administration, authentication, policy, leases and client heartbeats |
+| FRPC → embedded FRPS | 7000 | FRP login, proxy registration and work connections |
+| Edge → controller mTLS | 9443 | Node identity, keepalive, synchronization, commands and reports |
+| Visitor → tunnel port | For example, 25565 | Access to the user's local service |
 
-DPI policy is configured per user. Administrators can enable or disable the DPI gateway, select detectors, choose which detected traffic types are blocked, and inspect recorded events. Events contain the user, client, proxy, direction, addresses, matched detector, protocol metadata, decision, and timestamp.
+A successful HTTPS heartbeat is **not** proof of a working tunnel. Look for `login to server success` and `start proxy success`. Allocation and firewall rules do not create a listener; successful proxy registration does.
 
-The client resource-policy response also reports whether DPI is enabled and which traffic types are blocked, so MeowFRP Client can display the effective policy before starting a tunnel.
+API HTTPS, FRP transport TLS and node mTLS are independent. Automatic configuration enables embedded FRPS and keeps **FRP TLS disabled**. It does not disable HTTPS/mTLS, nor implement the proposed HTTPS key exchange, certificate pinning or custom encryption.
 
-## Architecture
+## Architecture and authentication
 
 ```text
-cmd/server                  Application entry point
-internal/config             Runtime and persisted configuration
-internal/db                 MySQL schema and data access
-internal/httpapi            Setup, admin, client, and FRP plugin APIs
-internal/frpcore            Embedded frps and live connection control
-internal/dpiengine          HTTP, TLS, QUIC, and encrypted-tunnel detectors
-internal/dpi                Per-user DPI policy and enforcement service
-internal/policy             Shared authorization decisions
-internal/security           Password, token, and session security
-front                       Vue 3 / Vite administration panel
-third_party/frp             Bundled and adapted FRP source
+Desktop client ── HTTPS/token ── Controller: authenticate, return authorized nodes
+       │
+       ├── HTTPS ── Selected node: policy, bootstrap, heartbeat, command ACK
+       └── FRP ──── Selected node: tunnels and forwarding
+
+Controller: MySQL, accounts, policy, directory, cache ownership
+       ⇅ bidirectional gRPC / HTTP2 over mTLS
+Edge: embedded SQLite file, synchronized identity, leases, events, commands
 ```
 
-The root module uses the bundled FRP source directly:
+Both `controller` and `edge` modes use `MeowFRP_server`. Only the controller needs MySQL. Edges use embedded SQLite, normally at `data/edge-state.db`; no separate database service is needed. This is not a custom database engine.
 
-```text
-replace github.com/fatedier/frp => ./third_party/frp
-```
+### Login and leases
 
-## Requirements
+1. The desktop client submits the generated user token and device ID to `POST /api/v1/client/login` on the controller.
+2. The controller checks the account, token, device and node permissions before returning the authorized directory.
+3. The selected node's `resource-policy` returns the FRP endpoint, resource limits and DPI status.
+4. `bootstrap` validates requested proxies, reserves ports and returns a TOML configuration with a runtime lease, normally valid for 24 hours.
+5. Internal FRP plugin callbacks validate the runtime token and allow only allocated proxies.
+6. Client HTTPS heartbeats normally run every ten seconds, delivering commands and acknowledgements.
 
-- Go 1.25 or later
-- Node.js and npm for building the web panel
-- MySQL 8.0 or a compatible MySQL server
-- Nginx or another static web server for production deployment
+The long-lived API token is not the FRP runtime token. Node pools, user policy and token grants must all permit a resource. Reserved management ports and active-lease ports cannot be allocated again. Desktop users do not sign in with the web administrator password.
 
-Create a UTF-8 database before first-time setup:
+### Active identity and DPI synchronization
 
-```sql
-CREATE DATABASE frp_control
-  CHARACTER SET utf8mb4
-  COLLATE utf8mb4_unicode_ci;
-```
+One `user_node_cache` many-to-many table tracks holders using `(user_id, node_id)` and a reverse `(node_id, user_id)` index.
+
+- Business changes and desired sync revisions commit in the same MySQL transaction.
+- `desired_revision` represents pending work; `applied_revision` represents a committed edge ACK.
+- Updates contain complete affected-user records, not patches that assume an existing cache.
+- Baselines use a `user_id` cursor, up to 64 users per page, then 512 KiB serialized-data fragments.
+- Ownership is confirmed only after complete-batch persistence and acknowledgement.
+- The timeout is 120 seconds without progress, not 30 seconds for the entire baseline.
+- Startup/reconnection discards identity caches. A generation-bound `cache_cleared` ACK resets controller ownership before rebuilding the baseline. New sessions stay closed until final confirmation.
+
+Node configuration, certificates, command deduplication, unacknowledged events and local bans are not disposable identity caches. Direct SQL business-table edits bypass the Web/API push notification path.
+
+### Telemetry, bans and faults
+
+Node heartbeats do not periodically upload complete client, connection or traffic inventories. The panel requests reports explicitly; offline-node views may show the last snapshot.
+
+Global inbound-IP changes go to all edges as deltas. Enrollment/reconnection sends a full replacement, including an empty list. Global and local bans are separate: removing one does not override the other. New global bans also enforce restrictions on matching existing connections.
+
+Disabled DPI reporting stops accumulating that event category. Queues have limits, durable events require persistence ACKs, and telemetry write errors do not automatically tear down the mTLS stream.
+
+A controller database failure first pauses new authentication, leases and proxy registration. Ten seconds of continuous failure declares a node fault. Notifications use the existing control stream and an in-memory node directory, not the failed database queue.
+
+Edges also close admission on control-channel failure, controller fault or local database failure. Clients with registered proxies receive a warning. Once their actual FRPS proxy count reaches zero, the next client heartbeat can require reauthentication. Process-alive flags and visitor counts are not proxy counts.
+
+This preserves a still-running data plane during **control-plane failures**. Power loss, process restart and FRP transport failure still interrupt tunnels. Revocation, bans and ordinary logout remain enforced. Healthy control state and completed synchronization are required before new sessions resume.
 
 ## Build
 
-Build the server:
+Requirements:
+
+- Go 1.25+ as declared by the module; this version was built with Go 1.26.2.
+- Node.js 20.19+ or 22.12+ satisfying Vite's engine requirement; use a supported LTS environment.
+- Controller: MySQL 5.7/8.0-compatible SQL, with native-password support enabled during setup. Validate your database distribution and privileges.
+- Static hosting and an HTTPS reverse proxy, such as Nginx.
+
+From the repository root, build Linux x86-64:
 
 ```bash
-go build -trimpath -o MeowFRP_server ./cmd/server
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o build/MeowFRP_server ./cmd/server
 ```
 
-Build the web panel:
+Build the panel:
 
 ```bash
 cd front
@@ -90,118 +111,131 @@ npm ci
 npm run build
 ```
 
-## Controller and edge modes
+Deploy the binary and **all** of `front/dist`, including lazy-loaded assets. The Go application does not serve the Vue pages.
 
-The same server binary and web panel support two deployment modes. When the runtime configuration is missing or invalid, the API listens on port 8080 on all interfaces and exposes only the setup flow.
+## First deployment
 
-- `controller` uses MySQL and can run as a standalone server. Edge access can later be enabled from System Settings.
-- `edge` is enrolled with a controller address and a short-lived, single-use enrollment token. It uses an embedded SQLite state database and does not need MySQL.
+Create a controller database; edges skip this step:
 
-Enrollment reuses the Controller's existing HTTPS API and can be reverse-proxied by Nginx on port 443. The Edge creates its private key locally and submits a CSR with a ten-minute, single-use enrollment token stored in plaintext in MySQL. It then switches automatically to the dedicated gRPC/HTTP2 mTLS endpoint (port 9443 by default). Edge certificates are valid for one year and are not renewed automatically; after expiry, an administrator generates a new enrollment token and manually reconnects from the Edge panel, then restarts the process to load the renewed cfg identity. Certificate material is stored as Base64 in cfg and private keys are never returned by management APIs.
-
-The same bidirectional mTLS stream carries a configurable 2–60 second heartbeat, client presence, connection snapshots, traffic counters, ACKed runtime-log/DPI event replay, and idempotent Controller commands. The Controller panel can aggregate Edge clients and connections, remotely terminate TCP connections, disconnect clients, and apply node-scoped or global inbound-IP blocks. Every report and remote action remains controlled by the Edge's local permission switches.
-
-The Edge panel also has a default-off “Allow Controller administration” master switch that can only be changed locally. When enabled, the Controller panel may update that Edge's reporting/remote-command permissions and, while the node is online, rotate its local administrator username and password. The plaintext password exists only in the Controller HTTPS request and the in-memory mTLS message; the Edge computes the bcrypt hash locally, and the password is never stored in MySQL, an offline command queue, or audit details. A successful rotation immediately invalidates existing Edge administrator sessions.
-
-The generated static files are written to `front/dist`.
-
-Run the test suite:
-
-```bash
-go test ./...
+```sql
+CREATE DATABASE frp_control
+  CHARACTER SET utf8mb4
+  COLLATE utf8mb4_unicode_ci;
 ```
 
-## First-Run Setup
+Use a dedicated account with application read/write and schema-upgrade privileges.
 
-Start the backend from a writable working directory:
+Run from a writable deployment directory:
 
 ```bash
-./MeowFRP_server -APIport=8080 -APIbind=127.0.0.1
+chmod +x MeowFRP_server
+./MeowFRP_server -APIbind=127.0.0.1 -APIport=8080
 ```
 
-The API listener defaults to port `8080` on all interfaces. Use `-APIport` to override the port and `-APIbind=127.0.0.1` to restrict it to localhost; the old `-port` flag remains as an alias. Administrator cookies are always `Secure`, so production panel access must use HTTPS (normally through Nginx).
+The unmodified API normally binds to `0.0.0.0:8080`, without HTTPS. Keep it on loopback behind an HTTPS proxy in production. `-port` is a legacy alias for `-APIport`.
 
-- the initial administrator username and password;
-- the MySQL host, port, username, password, and database name.
-
-The server verifies the database connection, creates or updates the schema, creates the administrator, generates security material, and writes `frp-control-server.cfg.json` in the working directory. This file contains sensitive database and authentication data and must not be committed.
-
-After initialization, a database outage opens the repair workflow instead of returning to first-run registration. Only the original administrator credentials can change the stored database configuration.
-
-## Deployment
-
-Serve `front/dist` as a single-page application and reverse-proxy `/api/` to the backend. A minimal Nginx layout is:
+Serve the panel and preserve `/api/` when proxying:
 
 ```nginx
 server {
     listen 443 ssl;
     server_name frp.example.com;
-
+    ssl_certificate /etc/nginx/certs/frp.example.com.crt;
+    ssl_certificate_key /etc/nginx/certs/frp.example.com.key;
     root /opt/meowfrp/front;
     index index.html;
 
-    location / {
-        try_files $uri /index.html;
-    }
-
     location ^~ /api/ {
         proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_http_version 1.1;
+        proxy_set_header X-Forwarded-Proto $scheme;
         proxy_buffering off;
+    }
+    location /assets/ {
+        try_files $uri =404;
+    }
+    location = /index.html {
+        add_header Cache-Control "no-cache" always;
+    }
+    location / {
+        try_files $uri $uri/ /index.html;
     }
 }
 ```
 
-Every Controller/Edge has its own node tag, public API URL, advertised FRP address, FRP control port, and usable port pool. The node pool is intersected with user policy and token grants, while API, FRP control, Controller mTLS, and currently leased ports are excluded. Changing the FRP control port requires a process restart; advertised addresses and port pools are saved immediately. A Controller can push these settings over mTLS only after the Edge enables Controller administration and runtime-setting changes.
+Replace domain, certificate and filesystem paths. `proxy_pass` intentionally has no trailing slash. Administrator cookies are `Secure`. History-mode page routes need the index fallback; missing JS/CSS should still return 404. On BaoTa, update existing location blocks rather than duplicating them.
 
-Cloud security groups and host firewalls usually do not open `1024-65535` by default. Explicitly allow the configured FRP control port and the TCP/UDP subset used by each node's port pool. Keep the backend API behind HTTPS in production.
+Open the HTTPS panel and choose controller or edge mode. Controller setup needs administrator/MySQL details; edge setup needs the controller address and enrollment token.
 
-## Client Flow
+The setup form derives the API URL from the browser origin plus `/api`, with manual override. It attempts public IPv4 detection; ambiguous/inconclusive results leave `127.0.0.1` for you to correct. Restart after initialization as directed to load the mode and listeners.
 
-1. MeowFRP Client first calls the Controller's unauthenticated `GET /api/v1/public/nodes`. The directory contains the Controller itself and selectable Edges, including tag, public API URL, node type, and online status.
-2. After node selection, the Client sends its long-lived token and device ID directly to that Edge; the Controller does not proxy the token.
-3. The Edge's `POST /api/v1/client/resource-policy` returns the FRP endpoint, permitted protocols, remote-port range, tunnel limit, and DPI status.
-4. The user selects tunnels within that policy.
-5. The Edge validates `POST /api/v1/client/bootstrap` against token hashes and policies synchronized into SQLite over mTLS, then returns a configuration containing a short-lived FRP token.
-6. Embedded `frps` validates the runtime token and allows only proxies allocated to that lease.
-7. The client sends `POST /api/v1/client/heartbeat` every ten seconds and receives queued control commands. Commands are retried until the client executes them and acknowledges them through the selected HTTPS API.
-8. Runtime leases default to 24 hours. A heartbeat timeout or `POST /api/v1/client/logout` revokes them immediately and closes tracked connections.
+Configuration normally lives in the working directory at `frp-control-server.cfg.json`. Preserve working directory, permissions and environment variables when using systemd or BaoTa supervision.
 
-Clients that stop sending heartbeats are removed from the connected-client view after the configured timeout, their queued commands are released, and active FRP access can be terminated.
+### Enroll edges and assign users
 
-If an Edge loses its Controller connection, new resource-policy and bootstrap requests return `edge_controller_disconnected`. Existing FRP leases remain locally valid, and a running Client receives one `show_warning` per outage.
+Enable multi-node access and create a short-lived, single-use enrollment token. The edge generates its private key locally, submits a CSR through HTTPS, then uses the dedicated mTLS channel.
 
-## API Groups
+Advertised node API URLs must be reachable by desktop clients, such as `https://edge.example.com/api`, not remote loopback. Assign allowed nodes and resource policies explicitly; possessing a token alone does not grant node or port access.
 
-- `/api/v1/system/*`: initialization, status, and database repair
-- `/api/v1/auth/*`: administrator login, session state, and logout
-- `/api/v1/admin/users*`: users and resource policies
-- `/api/v1/admin/tokens*`: API tokens, rotation, bans, and grants
-- `/api/v1/admin/clients*`: device history, bans, deletion, and commands
-- `/api/v1/admin/dpi-*`: DPI policies and detection events
-- `/api/v1/admin/edge-clients`, `/api/v1/admin/nodes/{id}/commands`: aggregated Edge clients and Controller commands
-- `/api/v1/admin/connections*`: active connections and termination
-- `/api/v1/admin/blocked-ips*`: inbound-IP block list
-- `/api/v1/client/*`: policy, bootstrap, heartbeat, and logout
-- `/api/v1/frp/plugin`: internal FRP authorization callback
+Allow the actual FRP and tunnel TCP/UDP ports in firewalls/security groups, plus the controller mTLS port when needed. Ports 7000/9443 are not ordinary HTTP `/api` routes.
 
-Administrative endpoints require an authenticated administrator session. Regular user API tokens cannot access the web administration API and cannot be used directly for FRP authentication.
+## Settings and DPI
 
-## Security Notes
+System Settings manages the current service's common configuration. Multi-node management contains enrollment, deletion and per-edge settings. Advanced options live at `/panel/settings/advanced`; `/panel/nodes/<nodeID>/settings/advanced` updates that edge through mTLS.
 
-- Always deploy the control API behind HTTPS.
-- Protect `frp-control-server.cfg.json` and database backups.
-- Use a dedicated MySQL account with only the required database privileges.
-- Restrict direct access to the backend API listener and FRP control port where possible.
-- DPI encrypted-tunnel detection is heuristic; review events and tune per-user blocking policies before broad enforcement.
+Advanced options include TCP mux, KeepAlive, pools, timeouts and mTLS handshake/session settings. Zero generally retains underlying defaults; some fields accept a special `-1`. Edge remote administration needs local approval, with separate reporting/action permissions. Follow restart notices for listener changes.
 
-## Third-Party Source
+DPI hooks inspect bounded flow samples for HTTP Host, TLS ClientHello/SNI, QUIC Initial and heuristic encrypted-tunnel patterns. Enable the user's policy explicitly. An explicit empty detector list disables detectors; it does not restore all of them.
 
-The adapted FRP source is stored under `third_party/frp` and retains its original Apache License 2.0 notice. MeowFRP-specific FRP integration changes include authorization hooks, connection tracking, live termination, and DPI data callbacks.
+DPI does not decrypt HTTPS payloads or reliably identify every encrypted protocol. A synchronized policy does not imply all existing flows were inspected again. Review events before broad blocking.
+
+## Troubleshooting and upgrades
+
+```bash
+curl -sS http://127.0.0.1:8080/api/v1/health
+ss -lntp '( sport = :7000 or sport = :9443 or sport = :25565 )'
+```
+
+- Check `frps.running`, not just the saved enable flag.
+- An edge's `database_ready:false` means the controller MySQL Store is not loaded; use mode, fault flags and sync state to judge health.
+- `EOF` is not automatically an invalid token; compare both endpoints' logs and captures.
+- `connect to local service ... refused` points to the client's local target.
+- Investigate listeners, active leases and duplicate processes before releasing occupied ports. Do not delete databases as a repair shortcut.
+
+Back up configuration, databases, edge state and certificates. Upgrade controller and all edges to the same version, preserving data and working directories. Older compatibility paths do not provide every new sync/draining guarantee. Node certificates do not renew automatically; plan reenrollment before expiry.
+
+Never commit real configuration, certificates, runtime TOML, captures or database backups.
+
+## Development map
+
+| Directory | Responsibility |
+| --- | --- |
+| `cmd/server` | Entry point and listener lifecycle |
+| `internal/httpapi` | Setup, admin/client APIs, FRP authorization and admission |
+| `internal/cluster` | mTLS, paging/chunks, ACKs, events and commands |
+| `internal/db` / `internal/edgestate` | Controller MySQL / edge SQLite |
+| `internal/frpcore` | Embedded FRPS, proxy counts, connections and bans |
+| `internal/dpi` / `internal/dpiengine` | Policy execution and detectors |
+| `front` | Vue 3, TypeScript, Vite and Vue Router |
+| `third_party/frp` | Adapted FRP source; current identifier 0.69.1 |
+
+The root module uses `replace github.com/fatedier/frp => ./third_party/frp`. Lease authorization, data hooks, connection control and proxy counts make an unadapted external FRPS an unsuitable drop-in replacement.
+
+Development checks:
+
+```bash
+go test ./...
+go vet ./...
+go test -race ./internal/cluster ./internal/edgestate ./internal/frpcore ./internal/httpapi
+```
+
+Race detection needs a C toolchain on a supported platform. Regression coverage does not establish real MySQL fault handling, Linux deployment or historical FRP compatibility on its own.
+
+More notes: [identity sync](./docs/USER_CACHE_SYNC_CN.md), [fault draining](./docs/NODE_FAULT_DRAIN_CN.md), [panel/BaoTa routing](./docs/WEB_PANEL_ROUTING_CN.md). These Chinese notes retain historical context; current code takes precedence over older state names or validation records.
 
 ## License
 
-MeowFRP Server is licensed under the [Apache License 2.0](./LICENSE).
+Server: [Apache License 2.0](./LICENSE). Bundled FRP retains its [original license](./third_party/frp/LICENSE). The companion client has a separate license.
