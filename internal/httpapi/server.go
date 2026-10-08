@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -23,6 +24,8 @@ import (
 )
 
 type Server struct {
+	fault             nodeFaultState
+	bootstrapMu       sync.Mutex
 	mu                sync.RWMutex
 	cfg               config.Config
 	store             *db.Store
@@ -32,6 +35,8 @@ type Server struct {
 	edgeState         *edgestate.Store
 	edgeClient        *cluster.EdgeClient
 	controllerControl *cluster.ControllerServer
+	restartRequired   bool
+	setupIP           setupIPCache
 }
 
 type Option func(*Server)
@@ -71,6 +76,14 @@ func NewServer(cfg config.Config, store *db.Store, opts ...Option) *Server {
 		server.core = frpcore.NewManager(server.dpi)
 	}
 	server.core.SetUDPFlowTimeout(cfg.UDPConnectionTTL)
+	server.fault.clients = map[string]*faultClient{}
+	server.fault.drains = map[string]bool{}
+	if server.edgeState != nil {
+		server.edgeState.SetDPIEventReporting(server.EdgeDPIEventsEnabled)
+	}
+	if server.edgeClient != nil {
+		server.edgeClient.SetFaultHandler(server.transitionNodeFault)
+	}
 	return server
 }
 
@@ -78,9 +91,15 @@ func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /api/v1/health", s.health)
-	mux.HandleFunc("GET /api/v1/public/nodes", s.publicNodeDirectory)
+	mux.HandleFunc("GET /api/v1/public/nodes", func(w http.ResponseWriter, r *http.Request) {
+		writeError(w, http.StatusUnauthorized, "请先使用用户 Token 登录中心节点")
+	})
+	mux.HandleFunc("POST /api/v1/client/login", s.clientAccountLogin)
+	mux.HandleFunc("GET /api/v1/admin/users/{id}/node-access", s.requireControllerAdmin(s.userNodeAccess))
+	mux.HandleFunc("PUT /api/v1/admin/users/{id}/node-access", s.requireControllerAdmin(s.userNodeAccess))
 	mux.HandleFunc("POST /api/v1/nodes/enroll", s.enrollEdgeNode)
 	mux.HandleFunc("GET /api/v1/system/bootstrap-state", s.bootstrapState)
+	mux.HandleFunc("GET /api/v1/system/setup-defaults", s.setupDefaults)
 	mux.HandleFunc("GET /api/v1/system/capabilities", s.capabilities)
 	mux.HandleFunc("POST /api/v1/system/setup-admin", s.setupAdmin)
 	mux.HandleFunc("POST /api/v1/system/setup", s.setupAdmin)
@@ -101,6 +120,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/v1/admin/dpi-policies", s.requireControllerAdmin(s.listDPIPolicies))
 	mux.HandleFunc("GET /api/v1/admin/dpi-events", s.requireControllerAdmin(s.listDPIEvents))
 	mux.HandleFunc("GET /api/v1/admin/users/{id}/dpi-policy", s.requireControllerAdmin(s.getUserDPIPolicy))
+	mux.HandleFunc("GET /api/v1/admin/users/{id}/cache-nodes", s.requireControllerAdmin(s.userIdentityCacheStates))
 	mux.HandleFunc("PUT /api/v1/admin/users/{id}/dpi-policy", s.requireControllerAdmin(s.updateUserDPIPolicy))
 
 	mux.HandleFunc("GET /api/v1/admin/tokens", s.requireControllerAdmin(s.listTokens))
@@ -121,11 +141,15 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/admin/blocked-ips", s.requireControllerAdmin(s.blockInboundIP))
 	mux.HandleFunc("DELETE /api/v1/admin/blocked-ips/{ip}", s.requireControllerAdmin(s.unblockInboundIP))
 	mux.HandleFunc("GET /api/v1/admin/system-settings", s.requireAdmin(s.getSystemSettings))
+	mux.HandleFunc("GET /api/v1/admin/system-settings/recommended", s.requireAdmin(s.getRecommendedSystemSettings))
 	mux.HandleFunc("PUT /api/v1/admin/system-settings", s.requireAdmin(s.updateSystemSettings))
 	mux.HandleFunc("GET /api/v1/admin/nodes", s.requireControllerAdmin(s.listEdgeNodes))
+	mux.HandleFunc("POST /api/v1/admin/nodes/refresh", s.requireControllerAdmin(s.refreshEdgeReports))
 	mux.HandleFunc("PUT /api/v1/admin/nodes/{id}", s.requireControllerAdmin(s.updateEdgeNode))
+	mux.HandleFunc("DELETE /api/v1/admin/nodes/{id}", s.requireControllerAdmin(s.deleteEdgeNode))
 	mux.HandleFunc("PUT /api/v1/admin/nodes/{id}/remote-permissions", s.requireControllerAdmin(s.updateEdgeRemotePermissions))
 	mux.HandleFunc("PUT /api/v1/admin/nodes/{id}/runtime-settings", s.requireControllerAdmin(s.updateEdgeRuntimeSettings))
+	mux.HandleFunc("PUT /api/v1/admin/nodes/{id}/advanced-settings", s.requireControllerAdmin(s.updateEdgeAdvancedSettings))
 	mux.HandleFunc("POST /api/v1/admin/nodes/{id}/admin-credentials", s.requireControllerAdmin(s.rotateEdgeAdminCredentials))
 	mux.HandleFunc("POST /api/v1/admin/nodes/{id}/commands", s.requireControllerAdmin(s.createEdgeCommand))
 	mux.HandleFunc("GET /api/v1/admin/edge-clients", s.requireControllerAdmin(s.listEdgeClients))
@@ -137,13 +161,14 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("POST /api/v1/admin/edge/re-enroll", s.requireAdmin(s.reEnrollEdge))
 
 	mux.HandleFunc("POST /api/v1/client/bootstrap", s.clientBootstrap)
+	mux.HandleFunc("POST /api/v1/client/release-lease", s.releaseClientLease)
 	mux.HandleFunc("POST /api/v1/client/resource-policy", s.clientResourcePolicy)
 	mux.HandleFunc("POST /api/v1/client/heartbeat", s.clientHeartbeat)
 	mux.HandleFunc("POST /api/v1/client/commands/{id}/ack", s.clientCommandACK)
 	mux.HandleFunc("POST /api/v1/client/logout", s.clientLogout)
 	mux.HandleFunc("POST /api/v1/frp/plugin", s.frpPlugin)
 
-	return s.withCommonHeaders(mux)
+	return s.withCommonHeaders(s.guardNodeAdmission(s.pushConfigurationChanges(mux)))
 }
 
 const (
@@ -152,6 +177,7 @@ const (
 )
 
 func (s *Server) StartClientHeartbeatWatchdog(ctx context.Context) {
+	go s.runNodeHealth(ctx)
 	go func() {
 		ticker := time.NewTicker(clientHeartbeatInterval)
 		defer ticker.Stop()
@@ -169,12 +195,18 @@ func (s *Server) StartClientHeartbeatWatchdog(ctx context.Context) {
 }
 
 func (s *Server) enforceClientHeartbeatTimeout(ctx context.Context) error {
+	if s.nodeUnavailable() {
+		return nil
+	}
 	if s.edgeState != nil {
 		clients, err := s.edgeState.StaleClients(ctx, time.Now().Add(-clientHeartbeatTimeout))
 		if err != nil {
 			return err
 		}
 		for _, client := range clients {
+			if s.clientIsDraining(client.TokenID, client.ClientID) {
+				continue
+			}
 			if err := s.edgeState.RevokeClient(ctx, client.TokenID, client.ClientID); err != nil {
 				return err
 			}
@@ -199,6 +231,9 @@ func (s *Server) enforceClientHeartbeatTimeout(ctx context.Context) error {
 		return err
 	}
 	for _, client := range clients {
+		if s.clientIsDraining(client.TokenID, client.ClientID) {
+			continue
+		}
 		terminated := s.terminateClientRuntime(ctx, client, "client heartbeat timeout")
 		deletedCommands, err := store.DeleteQueuedClientCommands(ctx, client.ID)
 		if err != nil {
@@ -224,6 +259,7 @@ func (s *Server) terminateClientRuntime(ctx context.Context, client db.Client, r
 
 func (s *Server) withCommonHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 2<<20)
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
 		w.Header().Set("Pragma", "no-cache")
@@ -235,6 +271,10 @@ func (s *Server) withCommonHeaders(next http.Handler) http.Handler {
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	cfg := s.getConfig()
 	response := map[string]any{"ok": true, "database_ready": s.getStore() != nil}
+	s.fault.mu.Lock()
+	response["node_fault"] = s.fault.closed
+	response["database_fault"] = s.fault.databaseFailed
+	s.fault.mu.Unlock()
 	if s.core != nil {
 		response["frps"] = s.core.Status(cfg)
 	}
@@ -339,6 +379,13 @@ func (s *Server) setRuntime(cfg config.Config, store *db.Store) {
 	s.cfg = cfg
 	s.store = store
 	s.mu.Unlock()
+	if s.edgeState != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		if err := s.edgeState.PruneDisabledDPIEvents(ctx); err != nil {
+			log.Printf("prune disabled edge DPI events: %v", err)
+		}
+		cancel()
+	}
 	if s.core != nil {
 		s.core.SetUDPFlowTimeout(cfg.UDPConnectionTTL)
 	}
@@ -360,10 +407,23 @@ func readJSON(r *http.Request, target any) error {
 	defer r.Body.Close()
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
-	return decoder.Decode(target)
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("request body must contain a single JSON value")
+		}
+		return err
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
+	if result, ok := value.(map[string]any); ok && result["status"] == "database_unavailable" {
+		status = http.StatusServiceUnavailable
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)

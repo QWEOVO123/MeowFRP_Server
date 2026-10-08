@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 const (
@@ -20,6 +23,8 @@ const (
 type Config struct {
 	ConfigPath          string
 	ConfigVersion       int
+	ConfigurationMode   string
+	ConnectionTuning    ConnectionTuning
 	Mode                string
 	ConfigState         string
 	ConfigError         string
@@ -112,6 +117,8 @@ type InitialAdminConfig struct {
 
 type FileConfig struct {
 	ConfigVersion       int                `json:"config_version,omitempty"`
+	ConfigurationMode   string             `json:"configuration_mode,omitempty"`
+	ConnectionTuning    ConnectionTuning   `json:"connection_tuning"`
 	Mode                string             `json:"mode,omitempty"`
 	MySQLDSN            string             `json:"mysql_dsn"`
 	CookieSecret        string             `json:"cookie_secret"`
@@ -147,6 +154,9 @@ func Load() (Config, error) {
 
 	if fileCfg, err := ReadFileConfig(cfg.ConfigPath); err == nil {
 		applyFileConfig(&cfg, fileCfg)
+		if cfg.ConfigurationMode == ConfigurationAutomatic {
+			ApplyRecommended(&cfg)
+		}
 		if err := Validate(cfg); err != nil {
 			cfg.ConfigState = "invalid"
 			cfg.ConfigError = err.Error()
@@ -163,6 +173,9 @@ func Load() (Config, error) {
 		return cfg, nil
 	}
 
+	if cfg.ConfigState == "unconfigured" {
+		ApplyRecommended(&cfg)
+	}
 	applyEnv(&cfg)
 	return cfg, nil
 }
@@ -170,6 +183,7 @@ func Load() (Config, error) {
 func defaults() Config {
 	return Config{
 		ConfigVersion:       2,
+		ConfigurationMode:   ConfigurationAutomatic,
 		HTTPAddr:            env("FRP_CONTROL_HTTP_ADDR", ":8080"),
 		CookieSecret:        env("FRP_CONTROL_COOKIE_SECRET", "dev-change-me-before-production"),
 		SessionTTL:          envDuration("FRP_CONTROL_SESSION_TTL", time.Hour),
@@ -285,8 +299,17 @@ func DSNFromDatabaseSetup(db DatabaseSetup) string {
 	if port == 0 {
 		port = 3306
 	}
-	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&charset=utf8mb4,utf8",
-		db.Username, db.Password, db.Host, port, db.Database)
+	dsn := (&mysql.Config{
+		User:                 db.Username,
+		Passwd:               db.Password,
+		Net:                  "tcp",
+		Addr:                 net.JoinHostPort(db.Host, strconv.Itoa(port)),
+		DBName:               db.Database,
+		ParseTime:            true,
+		MultiStatements:      true,
+		AllowNativePasswords: true,
+	}).FormatDSN()
+	return dsn + "&charset=utf8mb4,utf8"
 }
 
 func RandomSecret() (string, error) {
@@ -300,6 +323,8 @@ func RandomSecret() (string, error) {
 func (c Config) FileConfig() FileConfig {
 	return FileConfig{
 		ConfigVersion:       c.ConfigVersion,
+		ConfigurationMode:   c.ConfigurationMode,
+		ConnectionTuning:    c.ConnectionTuning,
 		Mode:                c.Mode,
 		MySQLDSN:            c.MySQLDSN,
 		CookieSecret:        c.CookieSecret,
@@ -322,6 +347,12 @@ func (c Config) FileConfig() FileConfig {
 }
 
 func applyFileConfig(cfg *Config, fileCfg FileConfig) {
+	cfg.ConnectionTuning = fileCfg.ConnectionTuning
+	cfg.ConfigurationMode = fileCfg.ConfigurationMode
+	if cfg.ConfigurationMode == "" {
+		// Legacy files may contain deliberate overrides. Never reset them silently.
+		cfg.ConfigurationMode = ConfigurationManual
+	}
 	cfg.ConfigVersion = fileCfg.ConfigVersion
 	if cfg.ConfigVersion == 0 {
 		cfg.ConfigVersion = 1
@@ -393,6 +424,12 @@ func applyFileConfig(cfg *Config, fileCfg FileConfig) {
 }
 
 func Validate(cfg Config) error {
+	if err := ValidateConnectionTuning(cfg.ConnectionTuning); err != nil {
+		return err
+	}
+	if cfg.ConfigurationMode != "" && cfg.ConfigurationMode != ConfigurationAutomatic && cfg.ConfigurationMode != ConfigurationManual {
+		return errors.New("configuration_mode must be automatic or manual")
+	}
 	if cfg.Mode != ModeController && cfg.Mode != ModeEdge {
 		return fmt.Errorf("mode must be %q or %q", ModeController, ModeEdge)
 	}

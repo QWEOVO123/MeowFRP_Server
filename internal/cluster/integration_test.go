@@ -129,12 +129,25 @@ func TestMTLSControlStreamRequiresIssuedNodeCertificate(t *testing.T) {
 	var touched bool
 	var completed string
 	var presence int
+	requestedReport := false
 	for time.Now().Before(deadline) {
 		store.mu.Lock()
 		touched = store.touched
 		completed = store.completed
 		presence = len(store.presence)
 		store.mu.Unlock()
+		if client.Connected() && touched && completed == "succeeded" && !requestedReport {
+			if presence != 0 {
+				t.Fatal("telemetry was reported without an explicit data pull")
+			}
+			pullCtx, pullCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			result, err := server.SendCommandAndWait(pullCtx, NodeCommand{CommandID: "pull-test", NodeID: "node-test", Command: "request_report", ExpiresAt: time.Now().Add(time.Second)})
+			pullCancel()
+			if err != nil || result.Status != "succeeded" {
+				t.Fatalf("explicit report pull: result=%#v err=%v", result, err)
+			}
+			requestedReport = true
+		}
 		if client.Connected() && touched && completed == "succeeded" && presence == 1 {
 			liveCtx, liveCancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer liveCancel()

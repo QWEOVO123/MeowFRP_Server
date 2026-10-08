@@ -61,7 +61,7 @@ func TestDisconnectedEdgeRejectsNewClientAuthentication(t *testing.T) {
 	request.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
 	server.Routes().ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), "edge_controller_disconnected") {
+	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), `"status":"node_fault"`) {
 		t.Fatalf("unexpected response: %d %s", recorder.Code, recorder.Body.String())
 	}
 }
@@ -123,9 +123,10 @@ func TestEdgeClientCommandAcknowledgementEndpoint(t *testing.T) {
 	}
 	defer state.Close()
 	snapshot := cluster.IdentitySnapshot{
-		Revision: 1,
-		Users:    []cluster.SnapshotUser{{ID: 7, Username: "alice", Role: "user", Status: "active"}},
-		Tokens:   []cluster.SnapshotToken{{ID: 9, UserID: 7, Name: "desktop", TokenHash: security.TokenHash("ak_secret"), Status: "active", MaxProxyCount: 1}},
+		Revision:           1,
+		NodeAccessEnforced: true,
+		Users:              []cluster.SnapshotUser{{ID: 7, Username: "alice", Role: "user", Status: "active"}},
+		Tokens:             []cluster.SnapshotToken{{ID: 9, UserID: 7, Name: "desktop", TokenHash: security.TokenHash("ak_secret"), Status: "active", MaxProxyCount: 1}},
 	}
 	payload, _ := json.Marshal(snapshot)
 	if err := state.ApplyIdentitySnapshot(ctx, payload); err != nil {
@@ -148,7 +149,7 @@ func TestEdgeClientCommandAcknowledgementEndpoint(t *testing.T) {
 	request.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
 	server.Routes().ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusOK {
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"ok":true`) {
 		t.Fatalf("ACK failed: %d %s", recorder.Code, recorder.Body.String())
 	}
 	commands, err = state.PopClientCommands(ctx, client.ID)
@@ -165,9 +166,10 @@ func TestEdgeClientLogoutImmediatelyRevokesRuntimeLease(t *testing.T) {
 	}
 	defer state.Close()
 	snapshot := cluster.IdentitySnapshot{
-		Revision: 1,
-		Users:    []cluster.SnapshotUser{{ID: 7, Username: "alice", Role: "user", Status: "active"}},
-		Tokens:   []cluster.SnapshotToken{{ID: 9, UserID: 7, Name: "desktop", TokenHash: security.TokenHash("ak_secret"), Status: "active", MaxProxyCount: 1}},
+		Revision:           1,
+		NodeAccessEnforced: true,
+		Users:              []cluster.SnapshotUser{{ID: 7, Username: "alice", Role: "user", Status: "active"}},
+		Tokens:             []cluster.SnapshotToken{{ID: 9, UserID: 7, Name: "desktop", TokenHash: security.TokenHash("ak_secret"), Status: "active", MaxProxyCount: 1}},
 	}
 	payload, _ := json.Marshal(snapshot)
 	if err := state.ApplyIdentitySnapshot(ctx, payload); err != nil {
@@ -189,7 +191,7 @@ func TestEdgeClientLogoutImmediatelyRevokesRuntimeLease(t *testing.T) {
 	request.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
 	server.Routes().ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusOK {
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), `"status":"logged_out"`) {
 		t.Fatalf("logout failed: %d %s", recorder.Code, recorder.Body.String())
 	}
 	stored, err := state.RuntimeLease(ctx, security.TokenHash("rt_secret"))
@@ -212,9 +214,10 @@ func TestEdgeHeartbeatTimeoutRevokesRuntimeLease(t *testing.T) {
 	}
 	defer state.Close()
 	snapshot := cluster.IdentitySnapshot{
-		Revision: 1,
-		Users:    []cluster.SnapshotUser{{ID: 7, Username: "alice", Role: "user", Status: "active"}},
-		Tokens:   []cluster.SnapshotToken{{ID: 9, UserID: 7, Name: "desktop", TokenHash: security.TokenHash("ak_secret"), Status: "active", MaxProxyCount: 1}},
+		Revision:           1,
+		NodeAccessEnforced: true,
+		Users:              []cluster.SnapshotUser{{ID: 7, Username: "alice", Role: "user", Status: "active"}},
+		Tokens:             []cluster.SnapshotToken{{ID: 9, UserID: 7, Name: "desktop", TokenHash: security.TokenHash("ak_secret"), Status: "active", MaxProxyCount: 1}},
 	}
 	payload, _ := json.Marshal(snapshot)
 	if err := state.ApplyIdentitySnapshot(ctx, payload); err != nil {
@@ -227,7 +230,7 @@ func TestEdgeHeartbeatTimeoutRevokesRuntimeLease(t *testing.T) {
 	if err := state.CreateLease(ctx, lease, nil); err != nil {
 		t.Fatal(err)
 	}
-	server := NewServer(config.Config{Mode: config.ModeEdge, ConfigState: "configured"}, nil, WithEdgeRuntime(state, nil))
+	server := newConnectedTestEdge(t, state)
 	if err := server.enforceClientHeartbeatTimeout(ctx); err != nil {
 		t.Fatal(err)
 	}

@@ -12,6 +12,7 @@ import (
 	"github.com/fatedier/frp/pkg/dpihook"
 	frpserver "github.com/fatedier/frp/server"
 
+	"frp-control-server/internal/db"
 	"frp-control-server/internal/dpi"
 	"frp-control-server/internal/dpiengine"
 )
@@ -79,6 +80,13 @@ type activeTCPConnection struct {
 }
 
 type Manager struct {
+	admissionMu          sync.RWMutex
+	admissionClosed      bool
+	drainingClients      map[string]bool
+	runtimeLeases        map[string]db.RuntimeLease
+	registeredProxies    map[string]string
+	proxyCounts          map[string]int
+	leaseProxyCounts     map[string]int
 	mu                   sync.RWMutex
 	closeOnce            sync.Once
 	inspector            Inspector
@@ -99,6 +107,11 @@ type Manager struct {
 
 func NewManager(inspector Inspector) *Manager {
 	manager := &Manager{
+		drainingClients:      map[string]bool{},
+		runtimeLeases:        map[string]db.RuntimeLease{},
+		registeredProxies:    map[string]string{},
+		proxyCounts:          map[string]int{},
+		leaseProxyCounts:     map[string]int{},
 		inspector:            inspector,
 		bindings:             map[string]ProxyBinding{},
 		leaseClientAddresses: map[string]string{},
@@ -304,6 +317,7 @@ func (m *Manager) TerminateConnectionsForUser(userID int64) int {
 	if userID <= 0 {
 		return 0
 	}
+	m.invalidateRuntime(func(l db.RuntimeLease) bool { return l.UserID == userID })
 	return m.terminateConnections(func(conn ActiveConnection) bool {
 		return conn.UserID == userID
 	})
@@ -313,6 +327,7 @@ func (m *Manager) TerminateConnectionsForToken(tokenID int64) int {
 	if tokenID <= 0 {
 		return 0
 	}
+	m.invalidateRuntime(func(l db.RuntimeLease) bool { return l.TokenID == tokenID })
 	return m.terminateConnections(func(conn ActiveConnection) bool {
 		return conn.TokenID == tokenID
 	})
@@ -323,9 +338,18 @@ func (m *Manager) TerminateConnectionsForClient(tokenID int64, clientID string) 
 	if tokenID <= 0 || clientID == "" {
 		return 0
 	}
+	m.invalidateRuntime(func(l db.RuntimeLease) bool { return l.TokenID == tokenID && l.ClientID == clientID })
 	return m.terminateConnections(func(conn ActiveConnection) bool {
 		return conn.TokenID == tokenID && conn.ClientID == clientID
 	})
+}
+
+func (m *Manager) TerminateConnectionsForLease(leaseID string) int {
+	if leaseID == "" {
+		return 0
+	}
+	m.invalidateRuntime(func(l db.RuntimeLease) bool { return l.LeaseID == leaseID })
+	return m.terminateConnections(func(conn ActiveConnection) bool { return conn.LeaseID == leaseID })
 }
 
 func (m *Manager) terminateConnections(match func(ActiveConnection) bool) int {
@@ -366,6 +390,16 @@ func (m *Manager) SetBlockedInboundIP(block BlockedInboundIP) {
 		block.CreatedAt = time.Now()
 	}
 	m.setBlockedInboundIP(block, false)
+}
+
+// Apply a remotely synchronized ban with the same enforcement as an admin ban:
+// deny new inbound traffic and close existing traffic from this IP. Preserve
+// the controller's timestamp instead of changing it on every identity update.
+func (m *Manager) EnforceBlockedInboundIP(block BlockedInboundIP) {
+	if block.CreatedAt.IsZero() {
+		block.CreatedAt = time.Now()
+	}
+	m.setBlockedInboundIP(block, true)
 }
 
 func (m *Manager) setBlockedInboundIP(block BlockedInboundIP, closeExisting bool) {

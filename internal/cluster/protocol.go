@@ -15,24 +15,56 @@ import (
 const controlMethod = "/meowfrp.cluster.v1.NodeControl/Connect"
 
 type Message struct {
-	Type         string          `json:"type"`
-	NodeID       string          `json:"node_id,omitempty"`
-	Sequence     int64           `json:"sequence,omitempty"`
-	Revision     int64           `json:"revision,omitempty"`
-	CommandID    string          `json:"command_id,omitempty"`
-	Capabilities json.RawMessage `json:"capabilities,omitempty"`
-	Payload      json.RawMessage `json:"payload,omitempty"`
-	SentAt       time.Time       `json:"sent_at"`
+	Type              string          `json:"type"`
+	NodeID            string          `json:"node_id,omitempty"`
+	Sequence          int64           `json:"sequence,omitempty"`
+	Revision          int64           `json:"revision,omitempty"`
+	CommandID         string          `json:"command_id,omitempty"`
+	Capabilities      json.RawMessage `json:"capabilities,omitempty"`
+	Payload           json.RawMessage `json:"payload,omitempty"`
+	SentAt            time.Time       `json:"sent_at"`
+	BootID            string          `json:"boot_id,omitempty"`
+	CacheProtocol     int             `json:"cache_protocol,omitempty"`
+	AdmissionProtocol int             `json:"admission_protocol,omitempty"`
+	CacheSessionID    string          `json:"cache_session_id,omitempty"`
+	SyncComplete      bool            `json:"sync_complete,omitempty"`
+}
+
+const maxControlMessageBytes = 32 << 20
+
+// Each wire frame stays well below gRPC's limit, even for a single large user.
+const identityChunkBytes = 512 << 10
+const identityIdleTimeout = 120 * time.Second
+
+type IdentityChunk struct {
+	Index int    `json:"index"`
+	Total int    `json:"total"`
+	Data  []byte `json:"data"`
+}
+
+func heartbeatTimeout(interval int64) time.Duration {
+	timeout := time.Duration(interval*3) * time.Second
+	if timeout < 15*time.Second {
+		timeout = 15 * time.Second
+	}
+	return timeout
 }
 
 type IdentitySnapshot struct {
-	Revision    int64                   `json:"revision"`
-	Users       []SnapshotUser          `json:"users"`
-	Tokens      []SnapshotToken         `json:"tokens"`
-	Policies    []db.UserResourcePolicy `json:"policies"`
-	Grants      []db.PortGrant          `json:"grants"`
-	DPIPolicies []dpi.Policy            `json:"dpi_policies"`
-	BlockedIPs  []db.BlockedInboundIP   `json:"blocked_ips"`
+	Baseline           bool                    `json:"baseline,omitempty"`
+	BaselineEnd        bool                    `json:"baseline_end,omitempty"`
+	ReplaceBlockedIPs  bool                    `json:"replace_blocked_ips,omitempty"`
+	Incremental        bool                    `json:"incremental,omitempty"`
+	RemovedUserIDs     []int64                 `json:"removed_user_ids,omitempty"`
+	NodeAccessEnforced bool                    `json:"node_access_enforced"`
+	Revision           int64                   `json:"revision"`
+	Users              []SnapshotUser          `json:"users"`
+	Tokens             []SnapshotToken         `json:"tokens"`
+	Policies           []db.UserResourcePolicy `json:"policies"`
+	Grants             []db.PortGrant          `json:"grants"`
+	DPIPolicies        []dpi.Policy            `json:"dpi_policies"`
+	BlockedIPs         []db.BlockedInboundIP   `json:"blocked_ips"`
+	RemovedBlockedIPs  []string                `json:"removed_blocked_ips,omitempty"`
 }
 
 type ClientPresence struct {
@@ -73,6 +105,7 @@ type EdgeTrafficSnapshot struct {
 }
 
 type HeartbeatPayload struct {
+	ReportError                 string                   `json:"report_error,omitempty"`
 	ClientsOnline               int                      `json:"clients_online"`
 	FRPConnections              int                      `json:"frp_connections"`
 	PendingEvents               int                      `json:"pending_events"`
@@ -83,9 +116,11 @@ type HeartbeatPayload struct {
 	Traffic                     *EdgeTrafficSnapshot     `json:"traffic,omitempty"`
 }
 type HeartbeatAck struct {
-	IntervalSeconds int       `json:"heartbeat_interval_seconds"`
-	ServerTime      time.Time `json:"server_time"`
-	ObservedAddress string    `json:"observed_address,omitempty"`
+	ControllerFault  bool      `json:"controller_fault"`
+	IdentityProtocol int       `json:"identity_protocol,omitempty"`
+	IntervalSeconds  int       `json:"heartbeat_interval_seconds"`
+	ServerTime       time.Time `json:"server_time"`
+	ObservedAddress  string    `json:"observed_address,omitempty"`
 }
 type EventEnvelope struct {
 	EventID   string          `json:"event_id"`

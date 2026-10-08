@@ -2,13 +2,19 @@ package dpi
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"frp-control-server/internal/dpiengine"
 )
 
 type Action string
+
+// Deliberate cache invalidation must not silently turn DPI into allow-all.
+var ErrPolicySynchronizing = errors.New("identity policy synchronization in progress")
 
 const (
 	ActionAllow   Action = "allow"
@@ -69,9 +75,14 @@ type Options struct {
 }
 
 type Service struct {
-	engine         dpiengine.Engine
-	policyProvider PolicyProvider
-	eventSink      EventSink
+	settingsMu          sync.RWMutex
+	providerUnavailable atomic.Bool
+	eventsPaused        atomic.Bool
+	policyMu            sync.RWMutex
+	leasePolicies       map[string]Policy
+	engine              dpiengine.Engine
+	policyProvider      PolicyProvider
+	eventSink           EventSink
 }
 
 func NewService(opts Options) *Service {
@@ -84,6 +95,7 @@ func NewService(opts Options) *Service {
 		provider = StaticPolicyProvider{Policy: DefaultPolicy()}
 	}
 	return &Service{
+		leasePolicies:  map[string]Policy{},
 		engine:         engine,
 		policyProvider: provider,
 		eventSink:      opts.EventSink,
@@ -94,14 +106,39 @@ func (s *Service) SetPolicyProvider(provider PolicyProvider) {
 	if s == nil || provider == nil {
 		return
 	}
+	s.settingsMu.Lock()
 	s.policyProvider = provider
+	s.settingsMu.Unlock()
+}
+
+// Freeze the last verified DPI policy for an already authenticated lease,
+// including tunnels which have not carried traffic yet. Never used for login.
+func (s *Service) PrimeLease(ctx context.Context, flow dpiengine.FlowContext) {
+	if s == nil || flow.LeaseID == "" {
+		return
+	}
+	s.settingsMu.RLock()
+	provider := s.policyProvider
+	s.settingsMu.RUnlock()
+	if p, err := provider.GetPolicy(ctx, flow); err == nil {
+		s.policyMu.Lock()
+		s.leasePolicies[flow.LeaseID] = p
+		s.policyMu.Unlock()
+	}
+}
+
+func (s *Service) SetProviderUnavailable(unavailable, pauseEvents bool) {
+	s.providerUnavailable.Store(unavailable)
+	s.eventsPaused.Store(unavailable && pauseEvents)
 }
 
 func (s *Service) SetEventSink(sink EventSink) {
 	if s == nil {
 		return
 	}
+	s.settingsMu.Lock()
 	s.eventSink = sink
+	s.settingsMu.Unlock()
 }
 
 func DefaultPolicy() Policy {
@@ -134,8 +171,34 @@ func (s *Service) Inspect(ctx context.Context, sample dpiengine.TrafficSample) D
 		sample.CapturedLength = len(sample.Payload)
 	}
 
-	policy, err := s.policyProvider.GetPolicy(ctx, sample.Flow)
-	if err != nil || !policy.Enabled {
+	var policy Policy
+	var err error
+	if s.providerUnavailable.Load() {
+		err = ErrPolicySynchronizing
+	} else {
+		policyCtx, cancel := context.WithTimeout(ctx, time.Second)
+		s.settingsMu.RLock()
+		provider := s.policyProvider
+		s.settingsMu.RUnlock()
+		policy, err = provider.GetPolicy(policyCtx, sample.Flow)
+		cancel()
+	}
+	if err == nil && sample.Flow.LeaseID != "" {
+		s.policyMu.Lock()
+		s.leasePolicies[sample.Flow.LeaseID] = policy
+		s.policyMu.Unlock()
+	} else if err != nil && sample.Flow.LeaseID != "" {
+		s.policyMu.RLock()
+		saved, ok := s.leasePolicies[sample.Flow.LeaseID]
+		s.policyMu.RUnlock()
+		if ok {
+			policy, err = saved, nil
+		}
+	}
+	if errors.Is(err, ErrPolicySynchronizing) {
+		return Decision{Action: ActionBlock, Reason: err.Error()}
+	}
+	if err != nil || !policy.Enabled || len(policy.EnabledDetectors) == 0 {
 		return Allow()
 	}
 	result, err := s.engine.Inspect(ctx, sample)
@@ -215,10 +278,18 @@ func (p StaticPolicyProvider) GetPolicy(context.Context, dpiengine.FlowContext) 
 }
 
 func (s *Service) record(ctx context.Context, sample dpiengine.TrafficSample, decision Decision, finding dpiengine.Finding) {
-	if s.eventSink == nil {
+	if s.eventsPaused.Load() {
 		return
 	}
-	s.eventSink.RecordDPIEvent(ctx, Event{
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	s.settingsMu.RLock()
+	sink := s.eventSink
+	s.settingsMu.RUnlock()
+	if sink == nil {
+		return
+	}
+	sink.RecordDPIEvent(ctx, Event{
 		Flow:       sample.Flow,
 		Direction:  sample.Direction,
 		Action:     decision.Action,
@@ -240,7 +311,7 @@ func filterFindings(findings []dpiengine.Finding, enabledDetectors []string) []d
 		}
 	}
 	if len(enabled) == 0 {
-		return findings
+		return nil
 	}
 	filtered := make([]dpiengine.Finding, 0, len(findings))
 	for _, finding := range findings {

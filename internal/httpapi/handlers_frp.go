@@ -86,6 +86,9 @@ func (s *Server) frpPlugin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, frpReject("bad plugin request: "+err.Error()))
 		return
 	}
+	if s.faultFRPPlugin(w, req) {
+		return
+	}
 	switch req.Op {
 	case "Login":
 		s.handleFrpLogin(w, r, req.Content)
@@ -118,6 +121,7 @@ func (s *Server) handleFrpLogin(w http.ResponseWriter, r *http.Request, raw json
 		return
 	}
 	clientAddress := clientAddressHost(content.ClientAddress)
+	s.rememberRuntime(r, lease)
 	if s.core != nil {
 		s.core.SetLeaseClientAddress(lease.LeaseID, clientAddress)
 	}
@@ -148,13 +152,17 @@ func (s *Server) handleFrpNewProxy(w http.ResponseWriter, r *http.Request, raw j
 		return
 	}
 	proxyType := normalizeProtocol(content.ProxyType)
+	if s.clientIsDraining(lease.TokenID, lease.ClientID) {
+		writeJSON(w, 200, frpReject("节点异常：禁止开启新穿透端口"))
+		return
+	}
 	if proxyType == "" {
 		writeJSON(w, http.StatusOK, frpReject("unsupported proxy type"))
 		return
 	}
 	domain := first(content.CustomDomains)
 	subdomain := strings.TrimSpace(content.Subdomain)
-	allocationName := stripFRPUserProxyPrefix(lease.UserID, content.ProxyName)
+	allocationName := stripFRPUserProxyPrefix(lease.UserID, content.ProxyName, lease.LeaseID)
 	if _, err := s.store.GetLeaseAllocation(r.Context(), lease.LeaseID, allocationName, proxyType, content.RemotePort, domain, subdomain); err != nil {
 		writeJSON(w, http.StatusOK, frpReject("proxy is not allocated by current lease"))
 		return
@@ -246,6 +254,10 @@ func (s *Server) handleFrpRuntimeKeepalive(w http.ResponseWriter, r *http.Reques
 		metas = content.User.Metas
 	}
 	if _, reject := s.validateRuntime(r, metas); reject != "" {
+		if reject == "node database unavailable" && s.allowFaultRuntime(metas) {
+			writeJSON(w, http.StatusOK, frpAllow())
+			return
+		}
 		writeJSON(w, http.StatusOK, frpReject(reject))
 		return
 	}
@@ -263,7 +275,8 @@ func (s *Server) validateRuntime(r *http.Request, metas map[string]string) (*db.
 		return nil, "invalid runtime token"
 	}
 	if err != nil {
-		return nil, "runtime token lookup failed"
+		s.databaseRejection(err)
+		return nil, "node database unavailable"
 	}
 	if lease.LeaseID != leaseID {
 		return nil, "runtime token and lease_id mismatch"
@@ -272,6 +285,18 @@ func (s *Server) validateRuntime(r *http.Request, metas map[string]string) (*db.
 		return nil, "runtime lease expired or inactive"
 	}
 	user, err := s.store.GetUserByID(r.Context(), lease.UserID)
+	if err != nil && !errors.Is(err, db.ErrNotFound) {
+		s.databaseRejection(err)
+		return nil, "node database unavailable"
+	}
+	allowed, accessErr := s.store.CanAccessNode(r.Context(), lease.UserID, "controller")
+	if accessErr != nil {
+		s.databaseRejection(accessErr)
+		return nil, "node database unavailable"
+	}
+	if !allowed {
+		return nil, "node access denied"
+	}
 	if err != nil || user.Status != "active" {
 		if user != nil && user.Status == "banned" && user.BanReason != "" {
 			return nil, user.BanReason
@@ -279,13 +304,24 @@ func (s *Server) validateRuntime(r *http.Request, metas map[string]string) (*db.
 		return nil, "user is not active"
 	}
 	token, err := s.store.GetAccessTokenByID(r.Context(), lease.TokenID)
+	if err != nil && !errors.Is(err, db.ErrNotFound) {
+		s.databaseRejection(err)
+		return nil, "node database unavailable"
+	}
 	if err != nil || token.Status != "active" {
 		if token != nil && token.Status == "banned" && token.BanReason != "" {
 			return nil, token.BanReason
 		}
 		return nil, "token is not active"
 	}
+	if token.ExpiresAt != nil && !time.Now().Before(*token.ExpiresAt) {
+		return nil, "access token expired"
+	}
 	client, err := s.store.GetClient(r.Context(), lease.TokenID, lease.ClientID)
+	if err != nil && !errors.Is(err, db.ErrNotFound) {
+		s.databaseRejection(err)
+		return nil, "node database unavailable"
+	}
 	if err != nil || client.Status != "active" {
 		if client != nil && client.Status == "banned" && client.BanReason != "" {
 			return nil, client.BanReason
@@ -293,6 +329,10 @@ func (s *Server) validateRuntime(r *http.Request, metas map[string]string) (*db.
 		return nil, "client is not active"
 	}
 	fresh, err := s.store.IsClientHeartbeatFresh(r.Context(), client.ID, int(clientHeartbeatTimeout.Seconds()))
+	if err != nil {
+		s.databaseRejection(err)
+		return nil, "node database unavailable"
+	}
 	if err != nil || !fresh {
 		s.terminateClientRuntime(r.Context(), *client, "client heartbeat timeout")
 		return nil, "client heartbeat timeout"
@@ -318,10 +358,13 @@ func first(values []string) string {
 	return strings.TrimSpace(values[0])
 }
 
-func stripFRPUserProxyPrefix(userID int64, proxyName string) string {
+func stripFRPUserProxyPrefix(userID int64, proxyName string, leaseIDs ...string) string {
 	prefix := fmt.Sprintf("u%d.", userID)
 	if trimmed, ok := strings.CutPrefix(proxyName, prefix); ok {
-		return trimmed
+		proxyName = trimmed
+	}
+	if len(leaseIDs) > 0 {
+		proxyName = strings.TrimPrefix(proxyName, leaseIDs[0]+".")
 	}
 	return proxyName
 }

@@ -11,6 +11,7 @@ import (
 	"frp-control-server/internal/cluster"
 	"frp-control-server/internal/config"
 	"frp-control-server/internal/db"
+	"frp-control-server/internal/dpi"
 	"frp-control-server/internal/edgestate"
 )
 
@@ -44,6 +45,37 @@ func TestControllerDirectoryAlwaysIdentifiesSelf(t *testing.T) {
 	item := controllerDirectoryItem(cfg, req)
 	if item == nil || item["node_id"] != "controller" || item["api_url"] != "https://controller.example.com/api" || item["online"] != true {
 		t.Fatalf("unexpected controller directory item: %#v", item)
+	}
+}
+
+func TestPublicAPIURLRequiresHTTPSOutsideLoopback(t *testing.T) {
+	for _, value := range []string{
+		"http://edge.example.com/api",
+		"https://user:pass@edge.example.com/api",
+		"https://edge.example.com/api?node=one",
+		"https://edge.example.com/api#fragment",
+	} {
+		if err := validatePublicAPIURL(value); err == nil {
+			t.Fatalf("unsafe public API URL was accepted: %q", value)
+		}
+	}
+	for _, value := range []string{"https://edge.example.com/api", "http://127.0.0.1:8080/api", "http://[::1]:8080/api", "http://localhost:8080/api"} {
+		if err := validatePublicAPIURL(value); err != nil {
+			t.Fatalf("safe public API URL %q was rejected: %v", value, err)
+		}
+	}
+}
+
+func TestDPISummaryReflectsCachedBlockPolicy(t *testing.T) {
+	policy := dpi.DefaultPolicy()
+	policy.Enabled = true
+	policy.Mode = dpi.ModeBlock
+	policy.EnabledDetectors = []string{"http", "tls"}
+	policy.AllowHTTP = true
+	policy.AllowTLS = false
+	summary := clientDPISummaryFromPolicy(policy)
+	if !summary.Enabled || summary.Mode != "block" || len(summary.AllowedTrafficTypes) != 1 || summary.AllowedTrafficTypes[0] != "http" || len(summary.BlockedTrafficTypes) != 1 || summary.BlockedTrafficTypes[0] != "tls" {
+		t.Fatalf("unexpected DPI summary: %#v", summary)
 	}
 }
 

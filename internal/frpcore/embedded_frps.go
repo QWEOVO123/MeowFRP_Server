@@ -42,6 +42,7 @@ func (m *Manager) StartEmbeddedFRPS(ctx context.Context, appCfg config.Config) e
 	if err != nil {
 		return err
 	}
+	service.ProxyLifecycle = m.proxyLifecycle()
 
 	m.mu.Lock()
 	m.frps = service
@@ -138,6 +139,13 @@ func BuildEmbeddedFRPSConfig(appCfg config.Config) (*v1.ServerConfig, error) {
 			},
 		},
 	}
+	muxEnabled := !appCfg.ConnectionTuning.DisableTCPMux
+	cfg.Transport.TCPMux = &muxEnabled
+	cfg.Transport.TCPMuxKeepaliveInterval = appCfg.ConnectionTuning.TCPMuxKeepaliveSeconds
+	cfg.Transport.TCPKeepAlive = appCfg.ConnectionTuning.TCPKeepaliveSeconds
+	cfg.Transport.MaxPoolCount = appCfg.ConnectionTuning.MaxPoolCount
+	cfg.Transport.HeartbeatTimeout = appCfg.ConnectionTuning.HeartbeatTimeoutSeconds
+	cfg.UserConnTimeout = appCfg.ConnectionTuning.UserConnectionTimeoutSeconds
 	if err := cfg.Complete(); err != nil {
 		return nil, err
 	}

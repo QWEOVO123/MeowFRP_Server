@@ -1,6 +1,25 @@
 package db
 
 var schemaStatements = []string{
+	`CREATE TABLE IF NOT EXISTS identity_sync_sequence (
+		id INT PRIMARY KEY, revision BIGINT NOT NULL
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+	`INSERT IGNORE INTO identity_sync_sequence(id,revision) VALUES(1,0)`,
+	`CREATE TABLE IF NOT EXISTS node_cache_sessions (
+		node_id VARCHAR(64) PRIMARY KEY, session_id VARCHAR(128) NOT NULL,
+		boot_id VARCHAR(128) NOT NULL, updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+	`CREATE TABLE IF NOT EXISTS user_node_cache (
+		user_id BIGINT NOT NULL, node_id VARCHAR(64) NOT NULL, session_id VARCHAR(128) NOT NULL,
+		applied_revision BIGINT NOT NULL DEFAULT 0, desired_revision BIGINT NOT NULL DEFAULT 0,
+		cached_at DATETIME(3) NULL,
+		PRIMARY KEY(user_id,node_id), INDEX idx_user_node_cache_node(node_id,user_id)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+	`CREATE TABLE IF NOT EXISTS user_node_access (
+		user_id BIGINT NOT NULL,
+		node_id VARCHAR(64) NOT NULL,
+		PRIMARY KEY(user_id,node_id), INDEX idx_user_node_access_node(node_id,user_id)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
 	`CREATE TABLE IF NOT EXISTS system_settings (
 		setting_key VARCHAR(128) PRIMARY KEY,
 		value TEXT NOT NULL,
@@ -359,6 +378,7 @@ var schemaStatements = []string{
 }
 
 var schemaMigrationStatements = []string{
+	`ALTER TABLE user_node_access ADD INDEX idx_user_node_access_node(node_id,user_id)`,
 	`ALTER TABLE access_tokens ADD COLUMN plain_token TEXT NULL AFTER token_prefix`,
 	`ALTER TABLE user_resource_policies ADD COLUMN allowed_protocols VARCHAR(128) NOT NULL DEFAULT 'tcp,udp' AFTER max_ports`,
 	`ALTER TABLE dpi_user_policies ADD COLUMN allow_http BOOLEAN NOT NULL DEFAULT TRUE AFTER block_on_any_finding`,
@@ -372,6 +392,7 @@ var schemaMigrationStatements = []string{
 	`ALTER TABLE edge_nodes ADD COLUMN public_api_url VARCHAR(512) NOT NULL DEFAULT '' AFTER last_remote_addr`,
 	`ALTER TABLE edge_nodes ADD COLUMN selectable BOOLEAN NOT NULL DEFAULT FALSE AFTER public_api_url`,
 	`ALTER TABLE node_enrollment_tokens ADD COLUMN plain_token VARCHAR(192) NULL UNIQUE AFTER token_hash`,
+	`ALTER TABLE node_enrollment_tokens ADD COLUMN settings_json TEXT NULL`,
 	`ALTER TABLE node_events ADD COLUMN event_id VARCHAR(96) NULL AFTER event_type`,
 	`ALTER TABLE node_events ADD UNIQUE KEY uq_node_event_id(node_id,event_id)`,
 	`ALTER TABLE dpi_events ADD COLUMN node_id VARCHAR(64) NOT NULL DEFAULT '' AFTER id`,
