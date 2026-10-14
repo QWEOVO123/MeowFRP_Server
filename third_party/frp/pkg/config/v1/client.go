@@ -166,6 +166,10 @@ func (c *ClientTransportConfig) Complete() {
 }
 
 type TLSClientConfig struct {
+	// MeowFRP: trust is fetched over verified HTTPS for every physical connection.
+	TrustFromAPI   bool   `json:"trustFromAPI,omitempty"`
+	ExpectedNodeID string `json:"expectedNodeID,omitempty"`
+	TrustAPIURL    string `json:"-"`
 	// TLSEnable specifies whether or not TLS should be used when communicating
 	// with the server. If "tls.certFile" and "tls.keyFile" are valid,
 	// client will load the supplied tls configuration.

@@ -1,12 +1,13 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
 
-func TestRecommendedOnlyEnablesFRPAndDisablesFRPTLS(t *testing.T) {
+func TestRecommendedEnablesFRPAndPreservesFRPTLS(t *testing.T) {
 	cfg := Config{
 		Mode:               ModeController,
 		EmbeddedFRPEnabled: false, FRPTransportTLS: true,
@@ -20,10 +21,35 @@ func TestRecommendedOnlyEnablesFRPAndDisablesFRPTLS(t *testing.T) {
 	}
 	expected := cfg
 	expected.EmbeddedFRPEnabled = true
-	expected.FRPTransportTLS = false
 	ApplyRecommended(&cfg)
 	if cfg != expected {
-		t.Fatal("automatic mode must change only embedded FRP and client FRP TLS")
+		t.Fatal("automatic mode must change only embedded FRP, preserving explicit TLS selection")
+	}
+}
+
+func TestFRPTLSDefaultAndExplicitDisable(t *testing.T) {
+	t.Setenv("FRP_CONTROL_FRP_TRANSPORT_TLS", "")
+	if !defaults().FRPTransportTLS {
+		t.Fatal("new installs must enable TLS")
+	}
+	for _, tc := range []struct {
+		body    string
+		enabled bool
+	}{{`{}`, true}, {`{"frp_transport_tls":false}`, false}, {`{"frp_transport_tls":true}`, true}} {
+		path := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(path, []byte(tc.body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := ReadFileConfig(path)
+		if err != nil || cfg.FRPTransportTLS != tc.enabled {
+			t.Fatal("default/override mismatch", err)
+		}
+		app := defaults()
+		applyFileConfig(&app, cfg)
+		ApplyRecommended(&app)
+		if app.FRPTransportTLS != tc.enabled {
+			t.Fatal("automatic mode overwrote explicit TLS selection")
+		}
 	}
 }
 

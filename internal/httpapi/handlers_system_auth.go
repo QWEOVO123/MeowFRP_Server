@@ -190,6 +190,10 @@ func (s *Server) setupAdmin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if err := s.prepareFRPIdentity(cfg); err != nil {
+		writeError(w, 500, "prepare FRP identity failed: "+err.Error())
+		return
+	}
 	user, err := store.CreateInitialAdmin(r.Context(), req.Username, req.DisplayName, hash)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -520,6 +524,10 @@ func (s *Server) updateSystemSettings(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, err.Error())
 			return
 		}
+		if err := s.prepareFRPIdentity(cfg); err != nil {
+			writeError(w, 500, "prepare FRP identity failed: "+err.Error())
+			return
+		}
 		if err := config.WriteFileConfig(cfg.ConfigPath, cfg.FileConfig()); err != nil {
 			writeError(w, 500, "write config failed: "+err.Error())
 			return
@@ -528,7 +536,7 @@ func (s *Server) updateSystemSettings(w http.ResponseWriter, r *http.Request) {
 		if s.edgeClient != nil {
 			s.edgeClient.SetCapabilities(edgeCapabilities(cfg))
 		}
-		restartRequired := oldCfg.Node.FRPBindPort != cfg.Node.FRPBindPort || oldCfg.EmbeddedFRPEnabled != cfg.EmbeddedFRPEnabled || oldCfg.FRPTransportTLS != cfg.FRPTransportTLS || oldCfg.FRPBindAddr != cfg.FRPBindAddr || oldCfg.FRPProxyBindAddr != cfg.FRPProxyBindAddr
+		restartRequired := oldCfg.Node.FRPBindPort != cfg.Node.FRPBindPort || oldCfg.EmbeddedFRPEnabled != cfg.EmbeddedFRPEnabled || oldCfg.FRPBindAddr != cfg.FRPBindAddr || oldCfg.FRPProxyBindAddr != cfg.FRPProxyBindAddr
 		restartRequired = s.noteSettingsRestart(cfg, restartRequired || oldCfg.ConnectionTuning != cfg.ConnectionTuning)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restart_required": restartRequired})
 		return
@@ -617,6 +625,10 @@ func (s *Server) updateSystemSettings(w http.ResponseWriter, r *http.Request) {
 	if s.controllerControl != nil {
 		s.controllerControl.SetHeartbeatInterval(cfg.Controller.HeartbeatIntervalSeconds)
 	}
+	if err := s.prepareFRPIdentity(cfg); err != nil {
+		writeError(w, 500, "prepare FRP identity failed: "+err.Error())
+		return
+	}
 	if err := config.WriteFileConfig(cfg.ConfigPath, cfg.FileConfig()); err != nil {
 		writeError(w, http.StatusInternalServerError, "write config failed: "+err.Error())
 		return
@@ -630,7 +642,7 @@ func (s *Server) updateSystemSettings(w http.ResponseWriter, r *http.Request) {
 		oldCfg.FRPBindAddr != cfg.FRPBindAddr ||
 		oldCfg.FRPProxyBindAddr != cfg.FRPProxyBindAddr ||
 		oldCfg.FRPServerPort != cfg.FRPServerPort ||
-		oldCfg.FRPTransportTLS != cfg.FRPTransportTLS || oldCfg.Controller.EdgeAccessEnabled != cfg.Controller.EdgeAccessEnabled || oldCfg.Controller.ListenAddr != cfg.Controller.ListenAddr || oldCfg.Controller.PublicAddress != cfg.Controller.PublicAddress
+		oldCfg.Controller.EdgeAccessEnabled != cfg.Controller.EdgeAccessEnabled || oldCfg.Controller.ListenAddr != cfg.Controller.ListenAddr || oldCfg.Controller.PublicAddress != cfg.Controller.PublicAddress
 	restartRequired = s.noteSettingsRestart(cfg, restartRequired || oldCfg.ConnectionTuning != cfg.ConnectionTuning)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "restart_required": restartRequired})
 }

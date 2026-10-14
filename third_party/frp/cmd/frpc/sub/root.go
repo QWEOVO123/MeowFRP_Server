@@ -44,10 +44,12 @@ var (
 	cfgDir           string
 	showVersion      bool
 	strictConfigMode bool
+	trustAPIURL      string
 	allowUnsafe      []string
 )
 
 func init() {
+	rootCmd.PersistentFlags().StringVar(&trustAPIURL, "trust-api", "", "verified HTTPS endpoint for in-memory MeowFRP trust; no certificate files")
 	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "./frpc.ini", "config file of frpc")
 	rootCmd.PersistentFlags().StringVarP(&cfgDir, "config_dir", "", "", "config directory, run one frpc service for each file in config directory")
 	rootCmd.PersistentFlags().BoolVarP(&showVersion, "version", "v", false, "version of frpc")
@@ -142,6 +144,12 @@ func runClient(cfgFilePath string, unsafeFeatures *security.UnsafeFeatures) erro
 
 // runClientWithAggregator runs the client using the internal source aggregator.
 func runClientWithAggregator(result *config.ClientConfigLoadResult, unsafeFeatures *security.UnsafeFeatures, cfgFilePath string) error {
+	if result.Common.Transport.TLS.TrustFromAPI {
+		if trustAPIURL == "" {
+			return fmt.Errorf("this configuration requires --trust-api and a matching MeowFRP client")
+		}
+		result.Common.Transport.TLS.TrustAPIURL = trustAPIURL
+	}
 	configSource := source.NewConfigSource()
 	if err := configSource.ReplaceAll(result.Proxies, result.Visitors); err != nil {
 		return fmt.Errorf("failed to set config source: %w", err)

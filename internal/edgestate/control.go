@@ -134,7 +134,7 @@ func (s *Store) BeginCommand(ctx context.Context, command cluster.NodeCommand) (
 	if err == nil {
 		if status == "executing" {
 			switch command.Command {
-			case "update_edge_runtime_settings", "update_edge_permissions", "update_edge_advanced_settings", "block_ip", "unblock_ip", "disconnect_client", "disconnect_connection":
+			case "update_edge_runtime_settings", "update_edge_permissions", "update_edge_advanced_settings", "block_ip", "unblock_ip", "disconnect_client", "disconnect_connection", "reset_frp_tls":
 				return true, nil, nil // all are idempotent desired-state operations
 			}
 		}

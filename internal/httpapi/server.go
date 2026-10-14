@@ -95,6 +95,9 @@ func (s *Server) Routes() http.Handler {
 		writeError(w, http.StatusUnauthorized, "请先使用用户 Token 登录中心节点")
 	})
 	mux.HandleFunc("POST /api/v1/client/login", s.clientAccountLogin)
+	mux.HandleFunc("GET /api/v1/client/frp-transport", s.frpTLSStatus)
+	mux.HandleFunc("GET /api/v1/client/frp-trust", s.frpTLSStatus)
+	mux.HandleFunc("POST /api/v1/admin/frp-tls/reset", s.requireAdmin(s.resetFRPTLS))
 	mux.HandleFunc("GET /api/v1/admin/users/{id}/node-access", s.requireControllerAdmin(s.userNodeAccess))
 	mux.HandleFunc("PUT /api/v1/admin/users/{id}/node-access", s.requireControllerAdmin(s.userNodeAccess))
 	mux.HandleFunc("POST /api/v1/nodes/enroll", s.enrollEdgeNode)
@@ -388,6 +391,7 @@ func (s *Server) setRuntime(cfg config.Config, store *db.Store) {
 	}
 	if s.core != nil {
 		s.core.SetUDPFlowTimeout(cfg.UDPConnectionTTL)
+		s.core.SetTLSRequired(cfg.FRPTransportTLS)
 	}
 	if s.dpi != nil && store != nil {
 		s.dpi.SetPolicyProvider(store)

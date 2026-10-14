@@ -52,18 +52,18 @@ const sessionTicketsEnabled = computed({ get: () => !props.settings.connection_t
           <button class="ghost" :class="{ selected: automatic }" type="button" :disabled="busy" :aria-pressed="automatic" @click="emit('mode', 'automatic')"><Sparkles :size="17" />自动推荐</button>
           <button class="ghost" :class="{ selected: !automatic }" type="button" :disabled="busy" :aria-pressed="!automatic" @click="emit('mode', 'manual')"><Settings :size="17" />手动配置</button>
         </div>
-        <p class="settings-note">{{ automatic ? '自动保持内置 FRP 开启、FRP TLS 关闭，不自动重置底层调优。未调整的项目沿用原默认值。' : '手动控制 FRP 启停和 TLS；底层参数保存到 cfg，重启后保留。' }} 正常节点接入和权限管理请使用“多节点”选项卡。</p>
+        <p class="settings-note">{{ automatic ? '自动保持内置 FRP 开启；新安装默认启用 TLS，保留手动选择，不自动重置底层调优。' : '手动控制 FRP 启停和 TLS；底层参数保存到 cfg，重启后保留。' }} 正常节点接入和权限管理请使用“多节点”选项卡。</p>
         </section>
         <div v-if="error" class="alert danger" role="alert">{{ error }}</div>
         <div v-if="notice" class="alert warning" role="status">{{ notice }}</div>
-        <p v-if="remote" class="settings-note">此处只修改 {{ nodeLabel }}，通过 mTLS 下发，不会修改中心设置。在线确认后提示已保存；离线命令保留 10 分钟。启停、TLS 与监听调优须重启该边缘节点。</p>
-        <p v-else class="advanced-status">内置 FRP 当前进程：<span class="pill" :class="frpsRunning ? 'active' : 'banned'">{{ frpsRunning === null ? '未知' : frpsRunning ? '运行中' : '未运行' }}</span>启停、TLS 和监听参数保存后需要重启后端。</p>
+        <p v-if="remote" class="settings-note">此处只修改 {{ nodeLabel }}，通过 mTLS 下发，不会修改中心设置。在线确认后提示已保存；离线命令保留 10 分钟。启停与监听调优须重启；TLS 开关对新连接即时生效。</p>
+        <p v-else class="advanced-status">内置 FRP 当前进程：<span class="pill" :class="frpsRunning ? 'active' : 'banned'">{{ frpsRunning === null ? '未知' : frpsRunning ? '运行中' : '未运行' }}</span>启停和监听参数需重启；TLS 开关对新连接即时生效。</p>
 
         <section v-show="category === 'frp'" class="panel advanced-category" data-category="frp">
-          <header><h4>FRP 与监听</h4><p>自动模式仅锁定服务开启和 TLS 关闭；其余参数可独立调整。</p></header>
+          <header><h4>FRP 与监听</h4><p>自动模式仅锁定服务开启；TLS 和其余参数可独立调整。</p></header>
           <fieldset class="form-grid" :disabled="busy">
             <label class="toggle-row span-all"><input v-model="settings.embedded_frps_enabled" type="checkbox" role="switch" :disabled="automatic" /><span>启用内置 FRP 服务</span></label>
-            <label class="toggle-row span-all"><input v-model="settings.frp_transport_tls" type="checkbox" role="switch" :disabled="automatic" /><span>启用客户端 FRP TLS（手动可选，默认关闭）</span></label>
+            <label class="toggle-row span-all"><input v-model="settings.frp_transport_tls" type="checkbox" role="switch" /><span>启用 FRP TLS（新安装默认开启；专属 CA 仅在 FRPC 内存中信任）</span></label>
             <label><span>FRP 控制监听地址</span><input v-model="settings.frp_bind_addr" placeholder="0.0.0.0" required /></label>
             <label><span>隧道端口监听地址</span><input v-model="settings.frp_proxy_bind_addr" placeholder="0.0.0.0" required /></label>
             <label class="span-all"><span>客户端配置注释</span><input v-model="settings.client_config_comment" maxlength="512" /></label>

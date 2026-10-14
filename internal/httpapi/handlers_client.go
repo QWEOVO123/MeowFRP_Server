@@ -436,8 +436,17 @@ func (s *Server) renderFrpcConfig(user *db.User, leaseID, runtimeToken string, p
 	fmt.Fprintf(&b, "serverPort = %d\n", cfg.FRPServerPort)
 	b.WriteString("loginFailExit = false\nlog.disablePrintColor = true\n")
 	fmt.Fprintf(&b, "user = %q\n", fmt.Sprintf("u%d", user.ID))
-	fmt.Fprintf(&b, "transport.tls.enable = %t\n", cfg.FRPTransportTLS)
+	tlsEnabled := cfg.FRPTransportTLS
+	if s.core != nil {
+		tlsEnabled = s.core.TLSRequired(cfg)
+	}
+	fmt.Fprintf(&b, "transport.tls.enable = %t\n", tlsEnabled)
 	fmt.Fprintf(&b, "transport.tcpMux = %t\n", !cfg.ConnectionTuning.DisableTCPMux)
+	// Only public identifiers are persisted. Certificates are fetched in FRPC memory.
+	if cfg.ConfigPath != "" {
+		b.WriteString("transport.tls.trustFromAPI = true\ntransport.tls.disableCustomTLSFirstByte = true\n")
+		fmt.Fprintf(&b, "transport.tls.expectedNodeID = %q\n", nodeTLSID(cfg))
+	}
 	if cfg.ConnectionTuning.TCPMuxKeepaliveSeconds > 0 {
 		fmt.Fprintf(&b, "transport.tcpMuxKeepaliveInterval = %d\n", cfg.ConnectionTuning.TCPMuxKeepaliveSeconds)
 	}

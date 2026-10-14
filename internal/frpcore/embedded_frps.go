@@ -22,6 +22,11 @@ type Status struct {
 }
 
 func (m *Manager) StartEmbeddedFRPS(ctx context.Context, appCfg config.Config) error {
+	if appCfg.ConfigPath != "" {
+		if err := m.EnsureTLSIdentity(appCfg); err != nil {
+			return fmt.Errorf("FRP node identity: %w", err)
+		}
+	}
 	if !appCfg.EmbeddedFRPEnabled {
 		return nil
 	}
@@ -38,7 +43,18 @@ func (m *Manager) StartEmbeddedFRPS(ctx context.Context, appCfg config.Config) e
 	m.mu.Unlock()
 
 	frplog.InitLogger(frpsCfg.Log.To, frpsCfg.Log.Level, int(frpsCfg.Log.MaxDays), frpsCfg.Log.DisablePrintColor)
-	service, err := frpserver.NewService(frpsCfg)
+	m.mu.RLock()
+	identity := m.tlsIdentity
+	m.mu.RUnlock()
+	var service *frpserver.Service
+	if identity != nil {
+		service, err = frpserver.NewServiceWithTLS(frpsCfg, identity.TLSConfig())
+	} else {
+		if appCfg.FRPTransportTLS {
+			return fmt.Errorf("FRP TLS identity is not initialized")
+		}
+		service, err = frpserver.NewService(frpsCfg)
+	}
 	if err != nil {
 		return err
 	}

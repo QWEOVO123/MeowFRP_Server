@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/fatedier/golib/crypto"
@@ -125,7 +126,8 @@ type Service struct {
 	// Auth runtime and encryption materials
 	auth *auth.ServerAuth
 
-	tlsConfig *tls.Config
+	tlsConfig   *tls.Config
+	tlsRequired atomic.Bool
 
 	cfg *v1.ServerConfig
 
@@ -136,12 +138,20 @@ type Service struct {
 }
 
 func NewService(cfg *v1.ServerConfig) (*Service, error) {
-	tlsConfig, err := transport.NewServerTLSConfig(
-		cfg.Transport.TLS.CertFile,
-		cfg.Transport.TLS.KeyFile,
-		cfg.Transport.TLS.TrustedCaFile)
-	if err != nil {
-		return nil, err
+	return NewServiceWithTLS(cfg, nil)
+}
+
+// Embedded applications can supply a node-local, hot-rotatable TLS identity.
+func NewServiceWithTLS(cfg *v1.ServerConfig, tlsConfig *tls.Config) (*Service, error) {
+	var err error
+	if tlsConfig == nil {
+		tlsConfig, err = transport.NewServerTLSConfig(
+			cfg.Transport.TLS.CertFile,
+			cfg.Transport.TLS.KeyFile,
+			cfg.Transport.TLS.TrustedCaFile)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	var webServer *httppkg.Server
@@ -354,8 +364,12 @@ func NewService(cfg *v1.ServerConfig) (*Service, error) {
 		return nil, fmt.Errorf("create nat hole controller error, %v", err)
 	}
 	svr.rc.NatHoleController = nc
+	svr.tlsRequired.Store(cfg.Transport.TLS.Force)
 	return svr, nil
 }
+
+func (svr *Service) SetTLSRequired(enabled bool) { svr.tlsRequired.Store(enabled) }
+func (svr *Service) TLSRequired() bool           { return svr.tlsRequired.Load() }
 
 func (svr *Service) Run(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
@@ -672,7 +686,7 @@ func (svr *Service) HandleListener(l net.Listener, internal bool) {
 		if !internal {
 			log.Tracef("start check TLS connection...")
 			originConn := c
-			forceTLS := svr.cfg.Transport.TLS.Force
+			forceTLS := svr.TLSRequired()
 			var isTLS, custom bool
 			c, isTLS, custom, err = netpkg.CheckAndEnableTLSServerConnWithTimeout(c, svr.tlsConfig, forceTLS, connReadTimeout)
 			if err != nil {

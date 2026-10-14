@@ -95,6 +95,10 @@ func (s *Server) setupEdge(w http.ResponseWriter, r *http.Request) {
 	if cfg.Edge.StatePath == "" {
 		cfg.Edge.StatePath = "data/edge-state.db"
 	}
+	if err := s.prepareFRPIdentity(cfg); err != nil {
+		writeError(w, 500, "prepare FRP identity failed: "+err.Error())
+		return
+	}
 	if err := config.WriteFileConfig(cfg.ConfigPath, cfg.FileConfig()); err != nil {
 		writeError(w, 500, "write config failed: "+err.Error())
 		return
@@ -725,10 +729,26 @@ func (s *Server) createEdgeCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch req.Command {
-	case "disconnect_client", "disconnect_connection", "block_ip", "unblock_ip":
+	case "disconnect_client", "disconnect_connection", "block_ip", "unblock_ip", "reset_frp_tls":
 	default:
 		writeError(w, 400, "unsupported edge command")
 		return
+	}
+	if req.Command == "reset_frp_tls" {
+		if req.Scope == "global" {
+			writeError(w, 400, "FRP key reset requires one node")
+			return
+		}
+		node, err := s.getStore().GetEdgeNode(r.Context(), nodeID)
+		if err != nil {
+			writeError(w, 404, "node not found")
+			return
+		}
+		if !controllerAdministrationAllowed(json.RawMessage(node.CapabilitiesJSON)) || !runtimeSettingsAllowed(json.RawMessage(node.CapabilitiesJSON)) {
+			writeError(w, 403, "remote runtime settings are disabled on this edge")
+			return
+		}
+		req.Payload = json.RawMessage(`{}`)
 	}
 	if req.Command == "disconnect_connection" {
 		var p struct {
@@ -787,7 +807,7 @@ func (s *Server) createEdgeCommand(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	targets := []string{nodeID}
-	waitForResult := req.Scope != "global" && (req.Command == "disconnect_client" || req.Command == "disconnect_connection")
+	waitForResult := req.Scope != "global" && (req.Command == "disconnect_client" || req.Command == "disconnect_connection" || req.Command == "reset_frp_tls")
 	if waitForResult {
 		if s.controllerControl == nil {
 			writeError(w, 503, "中心控制通道不可用")
@@ -1013,6 +1033,18 @@ func (s *Server) HandleEdgeCommand(ctx context.Context, command cluster.NodeComm
 	cfg := s.getConfig()
 	var output any
 	switch command.Command {
+	case "reset_frp_tls":
+		if !cfg.Edge.ControllerAdministrationEnabled || !cfg.Edge.RemoteCommands.ChangeRuntimeSettings || s.core == nil {
+			result.Error = "remote runtime settings are disabled on this edge"
+			break
+		}
+		if err := s.core.ResetTLSIdentity(cfg, command.CommandID); err != nil {
+			result.Error = "FRP identity reset failed: " + err.Error()
+			break
+		}
+		p, _ := s.core.TLSPublic(false)
+		result.Status = "succeeded"
+		output = map[string]any{"identity": p, "existing_connections_preserved": true}
 	case "update_edge_permissions":
 		if !cfg.Edge.ControllerAdministrationEnabled {
 			result.Error = "controller administration is disabled on this edge"
@@ -1082,13 +1114,17 @@ func (s *Server) HandleEdgeCommand(ctx context.Context, command cluster.NodeComm
 			result.Error = err.Error()
 			break
 		}
+		if err := s.prepareFRPIdentity(cfg); err != nil {
+			result.Error = err.Error()
+			break
+		}
 		if err := config.WriteFileConfig(cfg.ConfigPath, cfg.FileConfig()); err != nil {
 			result.Error = "write edge config failed: " + err.Error()
 			break
 		}
 		s.setRuntime(cfg, s.getStore())
 		restartRequired := s.noteSettingsRestart(cfg, oldCfg.EmbeddedFRPEnabled != cfg.EmbeddedFRPEnabled ||
-			oldCfg.FRPTransportTLS != cfg.FRPTransportTLS || oldCfg.FRPBindAddr != cfg.FRPBindAddr ||
+			oldCfg.FRPBindAddr != cfg.FRPBindAddr ||
 			oldCfg.FRPProxyBindAddr != cfg.FRPProxyBindAddr || oldCfg.ConnectionTuning != cfg.ConnectionTuning)
 		if s.edgeClient != nil {
 			s.edgeClient.SetCapabilities(edgeCapabilities(cfg))

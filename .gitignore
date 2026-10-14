@@ -1,5 +1,6 @@
 # Runtime configuration and secrets
 frp-control-server.cfg.json
+*.frp-tls.json*
 .env
 .env.*
 !.env.example

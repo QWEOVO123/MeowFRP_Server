@@ -74,7 +74,15 @@ func (d *controlSessionDialer) Dial(previousRunID string) (*SessionContext, erro
 		return nil, err
 	}
 
-	loginResult, err := d.exchangeLogin(conn, loginMsg)
+	tlsActive := lo.FromPtr(d.common.Transport.TLS.Enable) || d.common.Transport.Protocol == "wss" || d.common.Transport.Protocol == "quic"
+	if d.common.Transport.TLS.TrustFromAPI {
+		state, ok := connector.(interface{ TLSActive() bool })
+		if !ok {
+			return nil, fmt.Errorf("managed FRP connector did not report TLS state")
+		}
+		tlsActive = state.TLSActive()
+	}
+	loginResult, err := d.exchangeLoginWithTLS(conn, loginMsg, tlsActive)
 	if err != nil {
 		return nil, err
 	}
@@ -132,6 +140,10 @@ type loginExchangeResult struct {
 }
 
 func (d *controlSessionDialer) exchangeLogin(conn net.Conn, loginMsg *msg.Login) (*loginExchangeResult, error) {
+	return d.exchangeLoginWithTLS(conn, loginMsg, lo.FromPtr(d.common.Transport.TLS.Enable) || d.common.Transport.Protocol == "wss" || d.common.Transport.Protocol == "quic")
+}
+
+func (d *controlSessionDialer) exchangeLoginWithTLS(conn net.Conn, loginMsg *msg.Login, tlsActive bool) (*loginExchangeResult, error) {
 	rw := msg.NewV1ReadWriter(conn)
 	var wireConn *wire.Conn
 	var clientHello wire.ClientHello
@@ -147,7 +159,7 @@ func (d *controlSessionDialer) exchangeLogin(conn net.Conn, loginMsg *msg.Login)
 		var err error
 		clientHello, err = wire.NewClientHello(wire.BootstrapInfo{
 			Transport: d.common.Transport.Protocol,
-			TLS:       lo.FromPtr(d.common.Transport.TLS.Enable) || d.common.Transport.Protocol == "wss" || d.common.Transport.Protocol == "quic",
+			TLS:       tlsActive,
 			TCPMux:    lo.FromPtr(d.common.Transport.TCPMux),
 		})
 		if err != nil {

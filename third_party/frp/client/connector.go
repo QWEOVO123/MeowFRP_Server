@@ -17,10 +17,12 @@ package client
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	libnet "github.com/fatedier/golib/net"
@@ -78,13 +80,16 @@ func (c *messageConnector) Close() error {
 
 // defaultConnectorImpl is the default implementation of Connector for normal frpc.
 type defaultConnectorImpl struct {
-	ctx context.Context
-	cfg *v1.ClientCommonConfig
+	tlsActive atomic.Bool
+	ctx       context.Context
+	cfg       *v1.ClientCommonConfig
 
 	muxSession *fmux.Session
 	quicConn   *quic.Conn
 	closeOnce  sync.Once
 }
+
+func (c *defaultConnectorImpl) TLSActive() bool { return c.tlsActive.Load() }
 
 func NewConnector(ctx context.Context, cfg *v1.ClientCommonConfig) Connector {
 	return &defaultConnectorImpl{
@@ -102,6 +107,9 @@ func (c *defaultConnectorImpl) Open() error {
 
 	// special for quic
 	if strings.EqualFold(c.cfg.Transport.Protocol, "quic") {
+		if c.cfg.Transport.TLS.TrustFromAPI {
+			return fmt.Errorf("managed FRP TLS currently requires TCP transport")
+		}
 		var tlsConfig *tls.Config
 		var err error
 		sn := c.cfg.Transport.TLS.ServerName
@@ -188,7 +196,18 @@ func (c *defaultConnectorImpl) realConnect() (net.Conn, error) {
 	if c.cfg.Transport.Protocol == "wss" {
 		tlsEnable = true
 	}
-	if tlsEnable {
+	if c.cfg.Transport.TLS.TrustFromAPI {
+		if protocol := c.cfg.Transport.Protocol; protocol != "tcp" && protocol != "" {
+			return nil, fmt.Errorf("managed FRP TLS currently requires TCP transport")
+		}
+		xl.Infof("[MEOW_TLS] trust-fetch begin")
+		tlsConfig, tlsEnable, err = transport.FetchMemoryTrust(c.ctx, c.cfg.Transport.TLS.TrustAPIURL, c.cfg.Transport.TLS.ExpectedNodeID)
+		if err != nil {
+			xl.Warnf("[MEOW_TLS] trust-fetch failed")
+			return nil, err
+		}
+		xl.Infof("[MEOW_TLS] trust-fetch complete enabled=%t; trust is connection-local memory only", tlsEnable)
+	} else if tlsEnable {
 		sn := c.cfg.Transport.TLS.ServerName
 		if sn == "" {
 			sn = c.cfg.ServerAddr
@@ -217,7 +236,7 @@ func (c *defaultConnectorImpl) realConnect() (net.Conn, error) {
 		protocol = "tcp"
 		dialOptions = append(dialOptions, libnet.WithAfterHook(libnet.AfterHook{Hook: netpkg.DialHookWebsocket(protocol, "")}))
 		dialOptions = append(dialOptions, libnet.WithAfterHook(libnet.AfterHook{
-			Hook: netpkg.DialHookCustomTLSHeadByte(tlsConfig != nil, lo.FromPtr(c.cfg.Transport.TLS.DisableCustomTLSFirstByte)),
+			Hook: netpkg.DialHookCustomTLSHeadByte(tlsConfig != nil, c.cfg.Transport.TLS.TrustFromAPI || lo.FromPtr(c.cfg.Transport.TLS.DisableCustomTLSFirstByte)),
 		}))
 		dialOptions = append(dialOptions, libnet.WithTLSConfig(tlsConfig))
 	case "wss":
@@ -227,7 +246,7 @@ func (c *defaultConnectorImpl) realConnect() (net.Conn, error) {
 		dialOptions = append(dialOptions, libnet.WithAfterHook(libnet.AfterHook{Hook: netpkg.DialHookWebsocket(protocol, tlsConfig.ServerName), Priority: 110}))
 	default:
 		dialOptions = append(dialOptions, libnet.WithAfterHook(libnet.AfterHook{
-			Hook: netpkg.DialHookCustomTLSHeadByte(tlsConfig != nil, lo.FromPtr(c.cfg.Transport.TLS.DisableCustomTLSFirstByte)),
+			Hook: netpkg.DialHookCustomTLSHeadByte(tlsConfig != nil, c.cfg.Transport.TLS.TrustFromAPI || lo.FromPtr(c.cfg.Transport.TLS.DisableCustomTLSFirstByte)),
 		}))
 		dialOptions = append(dialOptions, libnet.WithTLSConfig(tlsConfig))
 	}
@@ -247,6 +266,9 @@ func (c *defaultConnectorImpl) realConnect() (net.Conn, error) {
 		net.JoinHostPort(c.cfg.ServerAddr, strconv.Itoa(c.cfg.ServerPort)),
 		dialOptions...,
 	)
+	if err == nil {
+		c.tlsActive.Store(tlsEnable)
+	}
 	return conn, err
 }
 

@@ -15,6 +15,7 @@ import (
 	"frp-control-server/internal/db"
 	"frp-control-server/internal/dpi"
 	"frp-control-server/internal/dpiengine"
+	"frp-control-server/internal/frptls"
 )
 
 const (
@@ -88,6 +89,8 @@ type Manager struct {
 	proxyCounts          map[string]int
 	leaseProxyCounts     map[string]int
 	mu                   sync.RWMutex
+	tlsInitMu            sync.Mutex
+	tlsIdentity          *frptls.Identity
 	closeOnce            sync.Once
 	inspector            Inspector
 	bindings             map[string]ProxyBinding
