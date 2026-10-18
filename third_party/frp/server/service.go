@@ -143,6 +143,12 @@ func NewService(cfg *v1.ServerConfig) (*Service, error) {
 
 // Embedded applications can supply a node-local, hot-rotatable TLS identity.
 func NewServiceWithTLS(cfg *v1.ServerConfig, tlsConfig *tls.Config) (*Service, error) {
+	if cfg.TCPOnly {
+		if cfg.KCPBindPort != 0 || cfg.QUICBindPort != 0 || cfg.SSHTunnelGateway.BindPort != 0 {
+			return nil, fmt.Errorf("this service supports TCP+TLS transport only")
+		}
+		cfg.Transport.TLS.Force = true
+	}
 	var err error
 	if tlsConfig == nil {
 		tlsConfig, err = transport.NewServerTLSConfig(
@@ -295,11 +301,13 @@ func NewServiceWithTLS(cfg *v1.ServerConfig, tlsConfig *tls.Config) (*Service, e
 	}
 
 	// Listen for accepting connections from client using websocket protocol.
-	websocketPrefix := []byte("GET " + netpkg.FrpWebsocketPath)
-	websocketLn := svr.muxer.Listen(0, uint32(len(websocketPrefix)), func(data []byte) bool {
-		return bytes.Equal(data, websocketPrefix)
-	})
-	svr.websocketListener = netpkg.NewWebsocketListener(websocketLn)
+	if !cfg.TCPOnly {
+		websocketPrefix := []byte("GET " + netpkg.FrpWebsocketPath)
+		websocketLn := svr.muxer.Listen(0, uint32(len(websocketPrefix)), func(data []byte) bool {
+			return bytes.Equal(data, websocketPrefix)
+		})
+		svr.websocketListener = netpkg.NewWebsocketListener(websocketLn)
+	}
 
 	// Create http vhost muxer.
 	if cfg.VhostHTTPPort > 0 {
@@ -368,7 +376,7 @@ func NewServiceWithTLS(cfg *v1.ServerConfig, tlsConfig *tls.Config) (*Service, e
 	return svr, nil
 }
 
-func (svr *Service) SetTLSRequired(enabled bool) { svr.tlsRequired.Store(enabled) }
+func (svr *Service) SetTLSRequired(enabled bool) { svr.tlsRequired.Store(svr.cfg.TCPOnly || enabled) }
 func (svr *Service) TLSRequired() bool           { return svr.tlsRequired.Load() }
 
 func (svr *Service) Run(ctx context.Context) {
@@ -394,7 +402,9 @@ func (svr *Service) Run(ctx context.Context) {
 	if svr.quicListener != nil {
 		go svr.HandleQUICListener(svr.quicListener)
 	}
-	go svr.HandleListener(svr.websocketListener, false)
+	if svr.websocketListener != nil {
+		go svr.HandleListener(svr.websocketListener, false)
+	}
 	go svr.HandleListener(svr.tlsListener, false)
 
 	if svr.rc.NatHoleController != nil {

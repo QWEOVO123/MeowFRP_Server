@@ -67,5 +67,5 @@ func (m *Manager) TLSRequired(cfg config.Config) bool {
 	if service != nil {
 		return service.TLSRequired()
 	}
-	return cfg.FRPTransportTLS
+	return true
 }

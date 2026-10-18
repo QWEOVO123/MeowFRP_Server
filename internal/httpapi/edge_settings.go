@@ -27,7 +27,7 @@ type edgeAdvancedSettings struct {
 func edgeAdvancedSnapshot(cfg config.Config) edgeAdvancedSettings {
 	return edgeAdvancedSettings{
 		ConfigurationMode: cfg.ConfigurationMode, ConnectionTuning: cfg.ConnectionTuning,
-		EmbeddedFRPEnabled: cfg.EmbeddedFRPEnabled, FRPTransportTLS: cfg.FRPTransportTLS,
+		EmbeddedFRPEnabled: cfg.EmbeddedFRPEnabled, FRPTransportTLS: true,
 		FRPBindAddr: cfg.FRPBindAddr, FRPProxyBindAddr: cfg.FRPProxyBindAddr,
 		SessionTTL: cfg.SessionTTL.String(), RuntimeTokenTTL: cfg.RuntimeTokenTTL.String(),
 		UDPConnectionTTL: cfg.UDPConnectionTTL.String(), ClientComment: cfg.ClientConfigComment,
@@ -35,6 +35,9 @@ func edgeAdvancedSnapshot(cfg config.Config) edgeAdvancedSettings {
 }
 
 func applyEdgeAdvancedSettings(cfg *config.Config, req edgeAdvancedSettings) error {
+	if !req.FRPTransportTLS {
+		return fmt.Errorf("仅支持 TCP+TLS，不能关闭 FRP TLS")
+	}
 	if req.ConfigurationMode != config.ConfigurationAutomatic && req.ConfigurationMode != config.ConfigurationManual {
 		return fmt.Errorf("configuration_mode must be automatic or manual")
 	}

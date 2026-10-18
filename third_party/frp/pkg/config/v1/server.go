@@ -23,6 +23,8 @@ import (
 
 type ServerConfig struct {
 	APIMetadata
+	// MeowFRP's embedded service exposes only TCP with mandatory TLS.
+	TCPOnly bool `json:"-"`
 
 	Auth AuthServerConfig `json:"auth,omitempty"`
 	// BindAddr specifies the address that the server binds to. By default,

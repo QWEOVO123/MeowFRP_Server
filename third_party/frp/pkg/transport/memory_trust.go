@@ -77,8 +77,8 @@ func fetchMemoryTrust(ctx context.Context, client *http.Client, apiURL, expected
 		return nil, false, fmt.Errorf("FRP trust response belongs to a different node")
 	}
 	if !trust.Enabled {
-		return nil, false, nil
-	} // Explicit HTTPS-confirmed server setting, never error fallback.
+		return nil, false, fmt.Errorf("this client requires TCP+TLS; enable FRP TLS on the selected node")
+	}
 	if trust.CAPEM == "" || trust.ServerName == "" || trust.Generation == "" {
 		return nil, false, fmt.Errorf("FRP TLS trust information is incomplete")
 	}

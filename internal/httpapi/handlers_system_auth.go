@@ -472,6 +472,10 @@ func (s *Server) updateSystemSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if req.FRPTransportTLS != nil && !*req.FRPTransportTLS {
+		writeError(w, 400, "仅支持 TCP+TLS，不能关闭 FRP TLS")
+		return
+	}
 	cfg := s.getConfig()
 	oldCfg := cfg
 	if req.ConnectionTuning != nil {

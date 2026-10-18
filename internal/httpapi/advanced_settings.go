@@ -41,6 +41,7 @@ func applyRuntimeTuning(cfg *config.Config, req updateSystemSettingsRequest) err
 }
 
 func prepareAdvancedSettings(cfg *config.Config) error {
+	cfg.FRPTransportTLS = true
 	if cfg.ConfigurationMode == config.ConfigurationAutomatic {
 		config.ApplyRecommended(cfg)
 	}

@@ -95,8 +95,8 @@ func TestMemoryTrustIsolatedRefetchedAndStrict(t *testing.T) {
 	}
 	override = ""
 	trust.Enabled = false
-	if cfg, enabled, err = fetch(); err != nil || enabled || cfg != nil {
-		t.Fatal("explicit HTTPS-confirmed disable ignored", err)
+	if cfg, enabled, err = fetch(); err == nil || enabled || cfg != nil {
+		t.Fatal("plaintext must be rejected even when explicitly requested by the node", err)
 	}
 	trust.Enabled = true
 	trust.CAPEM, _ = testFRPIdentity(t)

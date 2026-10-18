@@ -2034,7 +2034,7 @@ onUnmounted(() => {
           <section v-if="route.name === 'not-found'" class="panel route-status"><h3>404 · 页面不存在</h3><p>请检查地址，或从左侧导航打开管理栏目。</p><RouterLink class="primary" :to="panelPaths.overview">返回总览</RouterLink></section>
       <section v-if="activeNav === 'overview'" class="page-stack">
         <section class="panel advanced-entry">
-          <div><p class="eyebrow">配置控制台</p><h3>正常使用交给默认配置，需要时再精细调整</h3><p>{{ settingsForm.configuration_mode === 'automatic' ? '自动配置 · 内置 FRP 开启，保留 TLS 开关选择（新安装默认开启）' : '手动配置 · 保留已有参数' }}，其他参数和访问权限保持不变。</p></div>
+          <div><p class="eyebrow">配置控制台</p><h3>正常使用交给默认配置，需要时再精细调整</h3><p>{{ settingsForm.configuration_mode === 'automatic' ? '自动配置 · 内置 FRP 开启' : '手动配置 · 保留调优参数' }}，传输固定为 TCP + TLS。</p></div>
           <button class="primary" type="button" :disabled="busy" @click="openAdvancedOptions"><Settings :size="18" />高级选项</button>
         </section>
         <div class="stats-grid">
@@ -2837,7 +2837,7 @@ onUnmounted(() => {
                 <label><span>可用端口起始</span><input v-model.number="settingsForm.node.port_range_start" type="number" min="1" max="65535" required :disabled="nodeSettingsSaving" /></label>
                 <label><span>可用端口结束</span><input v-model.number="settingsForm.node.port_range_end" type="number" :min="settingsForm.node.port_range_start" max="65535" required :disabled="nodeSettingsSaving" /></label>
                 <label class="toggle-row span-all"><input v-model="settingsForm.node.selectable" type="checkbox" role="switch" :disabled="nodeSettingsSaving" /><span>允许获授权用户选择中心节点</span></label>
-                <label class="toggle-row span-all"><input v-model="settingsForm.frp_transport_tls" type="checkbox" role="switch" :disabled="nodeSettingsSaving" /><span>FRP TLS 加密（新安装默认开启，保存后新连接生效）</span></label>
+                <p class="settings-note span-all">FRP 连接固定使用 TCP + TLS 1.3，不支持明文连接。</p>
                 <p class="settings-note span-all">每个节点独立签发 CA。客户端通过正规 HTTPS 获取根证书，仅在 FRPC 内存中信任，不写入系统证书库。</p>
                 <button class="ghost" type="button" :disabled="busy || nodeSettingsSaving" @click="resetNodeFRPTLS()">重置中心 FRP CA 和私钥</button>
                 <p class="settings-note span-all">用户实际可用端口取用户策略与节点端口池的交集。访问中心节点同样需要用户节点授权。</p>
@@ -2948,7 +2948,7 @@ onUnmounted(() => {
             <label v-for="(label, key) in localPermissionLabels.remote_commands" :key="key" class="toggle-row"><input v-model="localNodeDraft.edge.remote_commands[key]" type="checkbox" role="switch" /><span>{{ label }}</span></label>
           </template>
         </fieldset>
-        <p class="settings-note span-all">仅保存本节点参数，不更改其他节点；FRP 控制端口变更需要重启。内置 FRP 和 TLS 新安装默认开启；TLS 开关和高级传输调优使用高级选项。</p>
+        <p class="settings-note span-all">仅保存本节点参数，不更改其他节点；FRP 控制端口变更需要重启。连接固定为 TCP + TLS；高级传输调优使用高级选项。</p>
         <div class="actions span-all"><button class="ghost" type="button" :disabled="nodeSettingsSaving || busy" @click="localNodeDraft = null">取消</button><button class="primary" type="submit" :disabled="nodeSettingsSaving || busy">{{ nodeSettingsSaving ? '保存中…' : '保存节点设置' }}</button></div>
       </form>
       <details v-if="deploymentMode === 'edge'" class="advanced-section reconnect-section"><summary>重新连接中心 / 更新节点证书</summary><form class="form-grid" @submit.prevent="reEnrollEdge"><label class="span-all"><span>中心 HTTPS API 地址</span><input v-model="edgeReEnrollForm.controller_address" required /></label><label class="span-all"><span>节点名称</span><input v-model="edgeReEnrollForm.node_name" required /></label><label class="span-all"><span>新的接入 Token</span><textarea v-model="edgeReEnrollForm.enrollment_token" required rows="4" /></label><button class="primary" type="submit" :disabled="busy || nodeSettingsSaving || !edgeReEnrollForm.enrollment_token">重新签发证书并写入 cfg</button></form></details>

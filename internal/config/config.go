@@ -374,7 +374,8 @@ func applyFileConfig(cfg *Config, fileCfg FileConfig) {
 	cfg.FRPProxyBindAddr = fileCfg.FRPProxyBindAddr
 	cfg.FRPServerAddr = fileCfg.FRPServerAddr
 	cfg.FRPServerPort = fileCfg.FRPServerPort
-	cfg.FRPTransportTLS = fileCfg.FRPTransportTLS
+	// Legacy false is accepted on disk for migration, but plaintext is no longer supported.
+	cfg.FRPTransportTLS = true
 	cfg.ClientConfigComment = fileCfg.ClientConfigComment
 	cfg.InitialAdmin = fileCfg.InitialAdmin
 	cfg.Initialized = fileCfg.Initialized || fileCfg.InitialAdmin.PasswordHash != ""
@@ -596,7 +597,7 @@ func applyEnv(cfg *Config) {
 	cfg.FRPProxyBindAddr = env("FRP_CONTROL_FRP_PROXY_BIND_ADDR", cfg.FRPProxyBindAddr)
 	cfg.FRPServerAddr = env("FRP_CONTROL_FRP_SERVER_ADDR", cfg.FRPServerAddr)
 	cfg.FRPServerPort = envInt("FRP_CONTROL_FRP_SERVER_PORT", cfg.FRPServerPort)
-	cfg.FRPTransportTLS = envBool("FRP_CONTROL_FRP_TRANSPORT_TLS", cfg.FRPTransportTLS)
+	cfg.FRPTransportTLS = true
 	cfg.ClientConfigComment = env("FRP_CONTROL_CLIENT_CONFIG_COMMENT", cfg.ClientConfigComment)
 	// Environment overrides retain their legacy names but feed the unified node
 	// runtime model used by both Controller and Edge.

@@ -5,8 +5,8 @@ const (
 	ConfigurationManual    = "manual"
 )
 
-// Fresh installations default to TLS. Preserve explicitly saved TLS choices,
-// including disabled TLS, when applying other automatic recommendations.
+// Product transport is always TCP+TLS, independently of tuning mode.
 func ApplyRecommended(cfg *Config) {
 	cfg.EmbeddedFRPEnabled = true
+	cfg.FRPTransportTLS = true
 }

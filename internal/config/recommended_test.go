@@ -47,8 +47,8 @@ func TestFRPTLSDefaultAndExplicitDisable(t *testing.T) {
 		app := defaults()
 		applyFileConfig(&app, cfg)
 		ApplyRecommended(&app)
-		if app.FRPTransportTLS != tc.enabled {
-			t.Fatal("automatic mode overwrote explicit TLS selection")
+		if !app.FRPTransportTLS {
+			t.Fatal("TCP+TLS migration permitted plaintext")
 		}
 	}
 }
@@ -73,7 +73,7 @@ func TestLegacyFileUsesManualModeWithoutChangingSwitches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.ConfigurationMode != ConfigurationManual || loaded.EmbeddedFRPEnabled || loaded.FRPTransportTLS {
-		t.Fatal("legacy overrides must be preserved")
+	if loaded.ConfigurationMode != ConfigurationManual || loaded.EmbeddedFRPEnabled || !loaded.FRPTransportTLS {
+		t.Fatal("preserve legacy mode/FRPS settings, but require TLS")
 	}
 }

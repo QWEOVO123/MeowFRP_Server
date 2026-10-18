@@ -16,7 +16,7 @@ func TestRecommendedSettingsPreviewDoesNotChangeRuntimeOrExposeSecrets(t *testin
 	defer s.core.Close()
 	response := httptest.NewRecorder()
 	s.getRecommendedSystemSettings(response, httptest.NewRequest("GET", "/api/v1/admin/system-settings/recommended", nil))
-	if s.getConfig().FRPTransportTLS || s.getConfig().ConfigurationMode != config.ConfigurationManual {
+	if !s.getConfig().FRPTransportTLS || s.getConfig().ConfigurationMode != config.ConfigurationManual {
 		t.Fatal("GET preview must not change runtime settings")
 	}
 	if strings.Contains(response.Body.String(), "secret-dsn") || strings.Contains(response.Body.String(), "secret-cookie") {
@@ -29,12 +29,12 @@ func TestAdvancedManualSavePreservesNodeAndDurationOverrides(t *testing.T) {
 	s := NewServer(cfg, nil)
 	defer s.core.Close()
 	response := httptest.NewRecorder()
-	s.updateSystemSettings(response, httptest.NewRequest("PUT", "/api/v1/admin/system-settings", strings.NewReader(`{"configuration_mode":"manual","frp_transport_tls":false,"runtime_token_ttl":"2h","embedded_frps_enabled":false}`)))
+	s.updateSystemSettings(response, httptest.NewRequest("PUT", "/api/v1/admin/system-settings", strings.NewReader(`{"configuration_mode":"manual","frp_transport_tls":true,"runtime_token_ttl":"2h","embedded_frps_enabled":false}`)))
 	if response.Code != 200 {
 		t.Fatalf("save failed: %s", response.Body.String())
 	}
 	actual := s.getConfig()
-	if actual.Node != cfg.Node || actual.FRPServerPort != 7000 || actual.RuntimeTokenTTL != 2*time.Hour || actual.FRPTransportTLS {
+	if actual.Node != cfg.Node || actual.FRPServerPort != 7000 || actual.RuntimeTokenTTL != 2*time.Hour || !actual.FRPTransportTLS {
 		t.Fatal("advanced-only save changed node settings or ignored manual overrides")
 	}
 }
@@ -44,6 +44,16 @@ func TestRestartNoticePersistsAcrossUnchangedSave(t *testing.T) {
 	defer s.core.Close()
 	if !s.noteSettingsRestart(config.Config{}, true) || !s.noteSettingsRestart(config.Config{}, false) {
 		t.Fatal("restart notice must persist until a new process starts")
+	}
+}
+
+func TestSettingsRejectTLSDisable(t *testing.T) {
+	s := NewServer(config.Config{Mode: config.ModeEdge}, nil)
+	defer s.core.Close()
+	response := httptest.NewRecorder()
+	s.updateSystemSettings(response, httptest.NewRequest("PUT", "/api/v1/admin/system-settings", strings.NewReader(`{"frp_transport_tls":false}`)))
+	if response.Code != 400 || !s.getConfig().FRPTransportTLS {
+		t.Fatal("TLS disable accepted")
 	}
 }
 
@@ -57,7 +67,7 @@ func TestTransportTuningSaveDoesNotChangeEdgePermissions(t *testing.T) {
 		t.Fatal(response.Body.String())
 	}
 	actual := s.getConfig()
-	if actual.Edge != cfg.Edge || actual.Node != cfg.Node || actual.ConnectionTuning.TCPKeepaliveSeconds != 300 || !actual.ConnectionTuning.EnableMTLSSessionResumption || actual.FRPTransportTLS {
+	if actual.Edge != cfg.Edge || actual.Node != cfg.Node || actual.ConnectionTuning.TCPKeepaliveSeconds != 300 || !actual.ConnectionTuning.EnableMTLSSessionResumption || !actual.FRPTransportTLS {
 		t.Fatal("advanced tuning changed ordinary settings or was not saved")
 	}
 	if !strings.Contains(response.Body.String(), `"restart_required":true`) {

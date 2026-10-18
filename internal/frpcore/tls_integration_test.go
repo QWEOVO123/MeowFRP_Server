@@ -6,7 +6,9 @@ import (
 	"crypto/x509"
 	"frp-control-server/internal/config"
 	"github.com/fatedier/frp/pkg/msg"
+	netpkg "github.com/fatedier/frp/pkg/util/net"
 	"github.com/fatedier/frp/pkg/util/version"
+	"golang.org/x/net/websocket"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,7 +18,7 @@ import (
 	"time"
 )
 
-func TestEmbeddedFRPTLSHotToggleAndRotationOnWire(t *testing.T) {
+func TestEmbeddedFRPTLSIsMandatoryAndRotationOnWire(t *testing.T) {
 	plugin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"reject":true,"reject_reason":"integration-test-auth-rejection","unchange":true}`))
@@ -67,8 +69,8 @@ func TestEmbeddedFRPTLSHotToggleAndRotationOnWire(t *testing.T) {
 	rotated := dial(clientTLS())
 	rotated.Close()
 	m.SetTLSRequired(false)
-	if m.TLSRequired(cfg) {
-		t.Fatal("runtime TLS disable ignored")
+	if !m.TLSRequired(cfg) {
+		t.Fatal("runtime setting bypassed mandatory TLS")
 	}
 	// Authentication is deliberately rejected by the mock plugin. Receiving a
 	// parsed LoginResp proves plaintext reached FRPS, independently of authorization.
@@ -84,12 +86,17 @@ func TestEmbeddedFRPTLSHotToggleAndRotationOnWire(t *testing.T) {
 		}
 		return msg.ReadMsg(conn)
 	}
-	response, err := login()
-	if err != nil {
-		t.Fatal("TLS disable did not accept plaintext protocol", err)
+	if _, err := login(); err == nil {
+		t.Fatal("legacy TLS disable permitted plaintext")
 	}
-	if _, ok := response.(*msg.LoginResp); !ok {
-		t.Fatal("no plaintext FRP response")
+	wsConfig, err := websocket.NewConfig("ws://"+address+netpkg.FrpWebsocketPath, "http://localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wsConfig.Dialer = &net.Dialer{Timeout: 3 * time.Second}
+	if conn, err := websocket.DialConfig(wsConfig); err == nil {
+		conn.Close()
+		t.Fatal("WebSocket upgrade bypassed TCP-only policy")
 	}
 	m.SetTLSRequired(true)
 	if !m.TLSRequired(cfg) {

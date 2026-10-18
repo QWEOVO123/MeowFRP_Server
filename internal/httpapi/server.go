@@ -61,6 +61,7 @@ func WithControllerControl(control *cluster.ControllerServer) Option {
 }
 
 func NewServer(cfg config.Config, store *db.Store, opts ...Option) *Server {
+	cfg.FRPTransportTLS = true
 	server := &Server{
 		cfg:    cfg,
 		store:  store,
@@ -377,6 +378,7 @@ func (s *Server) getStore() *db.Store {
 }
 
 func (s *Server) setRuntime(cfg config.Config, store *db.Store) {
+	cfg.FRPTransportTLS = true
 	s.mu.Lock()
 	old := s.store
 	s.cfg = cfg

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -44,6 +45,7 @@ func TestEmbeddedFRPSFaultDrainPreservesTunnelUntilLastProxyCloses(t *testing.T)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cfg := s.getConfig()
+	cfg.ConfigPath = filepath.Join(t.TempDir(), "server.json")
 	cfg.EmbeddedFRPEnabled = true
 	cfg.HTTPAddr = strings.TrimPrefix(api.URL, "http://")
 	cfg.FRPBindAddr = "127.0.0.1"
@@ -88,8 +90,18 @@ func TestEmbeddedFRPSFaultDrainPreservesTunnelUntilLastProxyCloses(t *testing.T)
 	if err := configSource.ReplaceAll([]v1.ProxyConfigurer{proxy}, nil); err != nil {
 		t.Fatal(err)
 	}
-	tlsEnabled := false
-	frpc, err := frpclient.NewService(frpclient.ServiceOptions{Common: &v1.ClientCommonConfig{ServerAddr: "127.0.0.1", ServerPort: cfg.FRPServerPort, Metadatas: map[string]string{"lease_id": lease.LeaseID, "token": "rt_test"}, Transport: v1.ClientTransportConfig{TLS: v1.TLSClientConfig{Enable: &tlsEnabled}}}, ConfigSourceAggregator: source.NewAggregator(configSource)})
+	tlsEnabled := true
+	identity, ready := s.core.TLSPublic(true)
+	if !ready {
+		t.Fatal("test TLS identity unavailable")
+	}
+	// Test-only CA fixture for this embedded Go client; production Qt/FRPC still
+	// downloads trust into memory through the node's HTTPS endpoint.
+	testCA := filepath.Join(t.TempDir(), "fixture-ca.pem")
+	if err := os.WriteFile(testCA, []byte(identity.CAPEM), 0600); err != nil {
+		t.Fatal(err)
+	}
+	frpc, err := frpclient.NewService(frpclient.ServiceOptions{Common: &v1.ClientCommonConfig{ServerAddr: "127.0.0.1", ServerPort: cfg.FRPServerPort, Metadatas: map[string]string{"lease_id": lease.LeaseID, "token": "rt_test"}, Transport: v1.ClientTransportConfig{TLS: v1.TLSClientConfig{Enable: &tlsEnabled, TLSConfig: v1.TLSConfig{TrustedCaFile: testCA, ServerName: identity.ServerName}}}}, ConfigSourceAggregator: source.NewAggregator(configSource)})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -22,6 +22,9 @@ type Status struct {
 }
 
 func (m *Manager) StartEmbeddedFRPS(ctx context.Context, appCfg config.Config) error {
+	if appCfg.EmbeddedFRPEnabled && appCfg.ConfigPath == "" {
+		return fmt.Errorf("TCP+TLS requires a persistent node configuration path")
+	}
 	if appCfg.ConfigPath != "" {
 		if err := m.EnsureTLSIdentity(appCfg); err != nil {
 			return fmt.Errorf("FRP node identity: %w", err)
@@ -124,6 +127,7 @@ func BuildEmbeddedFRPSConfig(appCfg config.Config) (*v1.ServerConfig, error) {
 	}
 
 	cfg := &v1.ServerConfig{
+		TCPOnly:       true,
 		BindAddr:      bindAddr,
 		BindPort:      bindPort,
 		ProxyBindAddr: proxyBindAddr,
@@ -132,7 +136,7 @@ func BuildEmbeddedFRPSConfig(appCfg config.Config) (*v1.ServerConfig, error) {
 		},
 		Transport: v1.ServerTransportConfig{
 			TLS: v1.TLSServerConfig{
-				Force: appCfg.FRPTransportTLS,
+				Force: true,
 			},
 		},
 		Log: v1.LogConfig{

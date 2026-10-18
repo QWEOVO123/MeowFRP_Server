@@ -48,11 +48,11 @@ func TestFRPTrustPublicAndDatabaseIndependent(t *testing.T) {
 	s.setRuntime(cfg, nil)
 	response := httptest.NewRecorder()
 	s.Routes().ServeHTTP(response, httptest.NewRequest("GET", "/api/v1/client/frp-transport", nil))
-	if !strings.Contains(response.Body.String(), `"enabled":false`) {
-		t.Fatal("explicit TLS disable not reported")
+	if !strings.Contains(response.Body.String(), `"enabled":true`) {
+		t.Fatal("mandatory TLS state must ignore legacy disable")
 	}
 	generated := s.renderFrpcConfig(&db.User{ID: 1}, "lease_test", "test_secret", nil)
-	if !strings.Contains(generated, "transport.tls.trustFromAPI = true") || !strings.Contains(generated, "transport.tls.enable = false") || strings.Contains(generated, "BEGIN CERTIFICATE") || strings.Contains(generated, "PRIVATE KEY") {
+	if !strings.Contains(generated, "transport.tls.trustFromAPI = true") || !strings.Contains(generated, "transport.tls.enable = true") || !strings.Contains(generated, `transport.protocol = "tcp"`) || strings.Contains(generated, "BEGIN CERTIFICATE") || strings.Contains(generated, "PRIVATE KEY") {
 		t.Fatal("runtime TOML must adapt without persisting trust")
 	}
 	response = httptest.NewRecorder()
